@@ -52,11 +52,11 @@ local CONFIG = {
 	TruckId = "Ford-LTL9000-1989",
 	TrailerId = "FlatBedSemi",
 	DeliveryMode = HIGH_RISK_MODE,
-	ExactPadRadius = 50,
-	FallbackPadRadius = 160,
-	InZoneRadiusXZ = 18, -- ถ้ารถอยู่ในระยะ 18 Studs แนวราบ จะห้ามวาร์ปซ้ำเด็ดขาดเพื่อไม่ให้หลอดสีเหลืองรีเซ็ต
-	StallRetryTime = 5.0, -- รอให้หลอดหมุนเต็มที่ 5 วินาที ถ้าของไม่ขยับเลยจริงๆ ถึงจะจัดตำแหน่งใหม่
-	SafeStreamAnchor = true,
+	ExactPadRadius = 55,
+	FallbackPadRadius = 170,
+	InZoneRadiusXZ = 20,      -- ระยะปลอดภัยในวง ห้ามวาร์ปซ้ำถ้าอยู่ในระยะนี้
+	IdleRepositionTime = 7.5, -- เวลาจัดมุมรถใหม่ (เฉพาะตอนหลอดเหลือง "ไม่ได้หมุน" เท่านั้น)
+	HardFreezeTime = 16.0,    -- เวลาจัดมุมรถใหม่ กรณีหลอดเหลืองหมุนค้างนานผิดปกติเพราะเซิร์ฟแล็ค
 	AutoSpawnSetup = true,
 	AntiAFK = true,
 }
@@ -69,8 +69,12 @@ local RUNTIME = {
 	maxCap = 8,
 	deliveriesDone = 0,
 	startCash = nil,
+	cachedCashObj = nil,
 	sessionStart = os.clock(),
-	trailerRelativeCF = CFrame.new(0, 0, 23), -- เก็บ CFrame สัมพัทธ์จริงระหว่างรถกับพ่วง
+	trailerRelativeCF = CFrame.new(0, 0, 23),
+	lastStreamPos = nil,
+	lastStreamClock = 0,
+	consecutiveTimeouts = 0,
 }
 
 local function isValidPart(part)
@@ -83,9 +87,16 @@ local function flatDistanceXZ(posA, posB)
 	return math.sqrt(dx * dx + dz * dz)
 end
 
--- โหลดแมพแบบไม่บล็อกลูปหลัก
+-- โหลดแมพพร้อมระบบ Throttle ป้องกันการสร้าง Thread ซ้ำซ้อนจนแล็ค
 local function safeRequestStream(pos, timeoutWait)
 	if not pos then return end
+	local now = os.clock()
+	if RUNTIME.lastStreamPos and (RUNTIME.lastStreamPos - pos).Magnitude < 60 and (now - RUNTIME.lastStreamClock) < 1.5 then
+		return
+	end
+	RUNTIME.lastStreamPos = pos
+	RUNTIME.lastStreamClock = now
+
 	local done = false
 	task.spawn(function()
 		pcall(function()
@@ -108,7 +119,7 @@ local function isAFKTeleportCall(remoteName, ...)
 	local args = { ... }
 	for _, v in ipairs(args) do
 		local s = tostring(v):lower()
-		if s == "afk" or s:find("afk") or v == AFK_PLACE_ID or s == tostring(AFK_PLACE_ID) then
+		if s == "afk" or s:find("afk") or v == AFK_PLACE_ID or v == tostring(AFK_PLACE_ID) then
 			return true
 		end
 	end
@@ -185,7 +196,13 @@ local function decodeCashValue(val)
 	return math.floor(num)
 end
 
+-- Cache Instance ของเงินเพื่อไม่ต้องเรียก pcall ค้นหาทุก 0.25 วินาที
 local function getPlayerCash()
+	if RUNTIME.cachedCashObj and RUNTIME.cachedCashObj.Parent then
+		local val = decodeCashValue(RUNTIME.cachedCashObj.Value)
+		if val then return val end
+	end
+
 	if DataModule then
 		local ok, statsFolder = pcall(function()
 			if type(DataModule.GetStatsFolder) == "function" then
@@ -198,6 +215,7 @@ local function getPlayerCash()
 		if ok and statsFolder then
 			local cashObj = statsFolder:FindFirstChild("Cash")
 			if cashObj then
+				RUNTIME.cachedCashObj = cashObj
 				local val = decodeCashValue(cashObj.Value)
 				if val then return val end
 			end
@@ -209,6 +227,7 @@ local function getPlayerCash()
 			local folder = (parent == LocalPlayer) and (parent:FindFirstChild("Stats") or parent:FindFirstChild("leaderstats"))
 				or (parent:FindFirstChild(LocalPlayer.Name) or parent:FindFirstChild(tostring(LocalPlayer.UserId)))
 			if folder and folder:FindFirstChild("Cash") then
+				RUNTIME.cachedCashObj = folder.Cash
 				local val = decodeCashValue(folder.Cash.Value)
 				if val then return val end
 			end
@@ -231,44 +250,59 @@ local function getMyVehicle()
 		or (Workspace:FindFirstChild("Vehicles") and Workspace.Vehicles:FindFirstChild(LocalPlayer.Name))
 end
 
+local function getRootPart(model)
+	if not model or not model.Parent then return nil end
+	return model.PrimaryPart or model:FindFirstChild("Weight") or model:FindFirstChildWhichIsA("BasePart", true)
+end
+
 local function isTrailerAttached(vehicle)
 	if not vehicle or not vehicle.Parent then return false end
 	local trailer = TowablesController.GetAttachedTrailer()
 	if trailer and trailer.Parent then
+		local vRoot = getRootPart(vehicle)
+		local tRoot = getRootPart(trailer)
+		-- เช็คด้วยว่าพ่วงไม่ได้หลุดกระเด็นไปไกลเกิน 65 Studs
+		if vRoot and tRoot and (vRoot.Position - tRoot.Position).Magnitude > 65 then
+			return false
+		end
 		return true
 	end
 	local hitch = CarTrailerUtil.GetHitchPart(vehicle, false)
 	return hitch and hitch:GetAttribute("IsAttached") == true
 end
 
+-- หยุดความเร็วผ่าน RootPart และ AssemblyRootPart โดยตรง (ไม่ต้องวน GetDescendants หลายร้อยชิ้นให้แล็ค)
 local function zeroVelocity(model)
-	if not model or not model.Parent then return end
-	for _, part in ipairs(model:GetDescendants()) do
-		if part:IsA("BasePart") then
-			part.AssemblyLinearVelocity = Vector3.zero
-			part.AssemblyAngularVelocity = Vector3.zero
-		end
+	local root = getRootPart(model)
+	if not root then return end
+	root.AssemblyLinearVelocity = Vector3.zero
+	root.AssemblyAngularVelocity = Vector3.zero
+	local asmRoot = root.AssemblyRootPart
+	if asmRoot and asmRoot ~= root then
+		asmRoot.AssemblyLinearVelocity = Vector3.zero
+		asmRoot.AssemblyAngularVelocity = Vector3.zero
 	end
 end
 
 local function setVehicleAnchored(vehicle, trailer, anchored)
-	if vehicle and vehicle.Parent then
-		local root = vehicle.PrimaryPart or vehicle:FindFirstChild("Weight") or vehicle:FindFirstChildWhichIsA("BasePart", true)
-		if root then root.Anchored = anchored end
-	end
-	if trailer and trailer.Parent then
-		local tRoot = trailer.PrimaryPart or trailer:FindFirstChild("Weight") or trailer:FindFirstChildWhichIsA("BasePart", true)
-		if tRoot then tRoot.Anchored = anchored end
-	end
+	local vRoot = getRootPart(vehicle)
+	if vRoot then vRoot.Anchored = anchored end
+	local tRoot = getRootPart(trailer)
+	if tRoot then tRoot.Anchored = anchored end
 end
 
--- กระตุ้นฟิสิกส์เบาๆ หลังวาร์ป เพื่อให้ Client ส่งแพ็กเก็ตอัปเดตตำแหน่งรถไปที่ Server ทันที (ป้องกันฟิสิกส์หลับ)
 local function wakeVehiclePhysics(vehicle, trailer)
 	if not vehicle or not vehicle.Parent then return end
 	setVehicleAnchored(vehicle, trailer, false)
-	local root = vehicle.PrimaryPart or vehicle:FindFirstChild("Weight") or vehicle:FindFirstChildWhichIsA("BasePart", true)
+	local root = getRootPart(vehicle)
 	if root then
-		root.AssemblyLinearVelocity = Vector3.new(0, -0.5, 0)
+		root.AssemblyLinearVelocity = Vector3.new(0, -0.4, 0)
+		root.AssemblyAngularVelocity = Vector3.zero
+	end
+	local tRoot = getRootPart(trailer)
+	if tRoot then
+		tRoot.AssemblyLinearVelocity = Vector3.new(0, -0.4, 0)
+		tRoot.AssemblyAngularVelocity = Vector3.zero
 	end
 	local seat = vehicle:FindFirstChildOfClass("VehicleSeat", true)
 	if seat then
@@ -284,30 +318,24 @@ local function wakeVehiclePhysics(vehicle, trailer)
 	end
 end
 
--- ประคองรถไม่ให้ไหลตกเนินโดยไม่ทำให้ฟิสิกส์หลับ
+-- ประคองรถไม่ให้ไหลตกเนินแบบ O(1) ไม่กิน CPU แม้เปิดข้ามวัน
 local function dampSlidingIfNeeded()
 	local vehicle = getMyVehicle()
-	local trailer = TowablesController.GetAttachedTrailer()
-	if vehicle and vehicle.Parent then
-		local root = vehicle.PrimaryPart or vehicle:FindFirstChild("Weight") or vehicle:FindFirstChildWhichIsA("BasePart", true)
-		if root then
-			local horizSpeed = Vector3.new(root.AssemblyLinearVelocity.X, 0, root.AssemblyLinearVelocity.Z).Magnitude
-			if horizSpeed > 2.2 or root.AssemblyAngularVelocity.Magnitude > 1.2 then
-				for _, part in ipairs(vehicle:GetDescendants()) do
-					if part:IsA("BasePart") then
-						part.AssemblyLinearVelocity = Vector3.new(0, part.AssemblyLinearVelocity.Y * 0.5, 0)
-						part.AssemblyAngularVelocity = Vector3.zero
-					end
-				end
-				if trailer and trailer.Parent then
-					for _, part in ipairs(trailer:GetDescendants()) do
-						if part:IsA("BasePart") then
-							part.AssemblyLinearVelocity = Vector3.new(0, part.AssemblyLinearVelocity.Y * 0.5, 0)
-							part.AssemblyAngularVelocity = Vector3.zero
-						end
-					end
-				end
-			end
+	local root = getRootPart(vehicle)
+	if not root then return end
+
+	local vel = root.AssemblyLinearVelocity
+	local horizSpeed = Vector3.new(vel.X, 0, vel.Z).Magnitude
+	if horizSpeed > 2.0 or root.AssemblyAngularVelocity.Magnitude > 1.0 then
+		root.AssemblyLinearVelocity = Vector3.new(0, math.clamp(vel.Y * 0.5, -5, 2), 0)
+		root.AssemblyAngularVelocity = Vector3.zero
+
+		local trailer = TowablesController.GetAttachedTrailer()
+		local tRoot = getRootPart(trailer)
+		if tRoot then
+			local tVel = tRoot.AssemblyLinearVelocity
+			tRoot.AssemblyLinearVelocity = Vector3.new(0, math.clamp(tVel.Y * 0.5, -5, 2), 0)
+			tRoot.AssemblyAngularVelocity = Vector3.zero
 		end
 	end
 end
@@ -325,24 +353,23 @@ local function ensurePlayerSeated(vehicle)
 		setVehicleAnchored(vehicle, TowablesController.GetAttachedTrailer(), false)
 		zeroVelocity(vehicle)
 		char:PivotTo(seat.CFrame)
-		task.wait(0.1)
+		task.wait(0.08)
 		pcall(function() seat:Sit(hum) end)
-		task.wait(0.25)
+		task.wait(0.2)
 	end
 	return hum.SeatPart == seat
 end
 
--- คำนวณ CFrame ให้ขนานไปกับความลาดชันของพื้นดิน (Slope-Aligned) เพื่อไม่ให้หางพ่วงจมเนินดิน
+local sharedRayParams = RaycastParams.new()
+sharedRayParams.FilterType = Enum.RaycastFilterType.Exclude
+sharedRayParams.RespectCanCollide = true
+
 local function getSlopeAlignedGroundCFrame(targetCF, ignoreList, flipYaw)
 	local pos = targetCF.Position
 	local _, yaw, _ = targetCF:ToEulerAnglesYXZ()
 	if flipYaw then
 		yaw = yaw + math.pi
 	end
-
-	local params = RaycastParams.new()
-	params.FilterType = Enum.RaycastFilterType.Exclude
-	params.RespectCanCollide = true
 
 	local exclusions = {}
 	if ignoreList then
@@ -353,12 +380,12 @@ local function getSlopeAlignedGroundCFrame(targetCF, ignoreList, flipYaw)
 	for _, locPart in ipairs(CollectionService:GetTagged(DeliveryConstants.Tags.DeliveryLocation)) do
 		table.insert(exclusions, locPart)
 	end
-	params.FilterDescendantsInstances = exclusions
+	sharedRayParams.FilterDescendantsInstances = exclusions
 
 	local function castGround(checkPos)
-		local hit = Workspace:Raycast(checkPos + Vector3.new(0, 15, 0), Vector3.new(0, -75, 0), params)
+		local hit = Workspace:Raycast(checkPos + Vector3.new(0, 18, 0), Vector3.new(0, -80, 0), sharedRayParams)
 		if not hit then
-			hit = Workspace:Raycast(checkPos + Vector3.new(0, 55, 0), Vector3.new(0, -150, 0), params)
+			hit = Workspace:Raycast(checkPos + Vector3.new(0, 55, 0), Vector3.new(0, -150, 0), sharedRayParams)
 		end
 		return hit and hit.Position.Y or checkPos.Y
 	end
@@ -366,7 +393,6 @@ local function getSlopeAlignedGroundCFrame(targetCF, ignoreList, flipYaw)
 	local flatRot = CFrame.Angles(0, yaw, 0)
 	local lookVec = flatRot.LookVector
 
-	-- วัดความสูงพื้นตรงหน้ารถ (+5 Studs) และท้ายพ่วง (-18 Studs) เพื่อเอียงรถตามเนินดิน
 	local frontCheck = pos + (lookVec * 5)
 	local backCheck = pos - (lookVec * 18)
 	local centerY = castGround(pos)
@@ -374,10 +400,9 @@ local function getSlopeAlignedGroundCFrame(targetCF, ignoreList, flipYaw)
 	local backY = castGround(backCheck)
 
 	local pitch = math.atan2(frontY - backY, 23)
-	pitch = math.clamp(pitch, math.rad(-22), math.rad(22))
+	pitch = math.clamp(pitch, math.rad(-20), math.rad(20))
 
-	local baseHeight = math.max(centerY, (frontY + backY) * 0.5) + 2.8
-	-- ขยับหัวรถไปด้านหน้า 4 Studs เพื่อให้จุดกึ่งกลางรถและพ่วงอยู่ในวงกลมพอดี
+	local baseHeight = math.max(centerY, (frontY + backY) * 0.5) + 2.7
 	return CFrame.new(pos.X, baseHeight, pos.Z) * CFrame.Angles(0, yaw, 0) * CFrame.Angles(pitch, 0, 0) * CFrame.new(0, 0, -4)
 end
 
@@ -424,7 +449,17 @@ local function getDeliveryLocationPart(targetPos, customRadius)
 	return fallbackPart or locations[1]
 end
 
--- ย้ายรถและพ่วงด้วย Relative CFrame จริงตามแนวความชันของถนน
+local function updateTrailerRelativeOffset(vehicle, trailer)
+	if vehicle and vehicle.Parent and trailer and trailer.Parent then
+		pcall(function()
+			local rel = vehicle:GetPivot():ToObjectSpace(trailer:GetPivot())
+			if rel.Position.Magnitude >= 12 and rel.Position.Magnitude <= 35 then
+				RUNTIME.trailerRelativeCF = CFrame.new(0, rel.Position.Y, rel.Position.Z)
+			end
+		end)
+	end
+end
+
 local function pivotTruckAndTrailerAligned(vehicle, trailer, cabCF)
 	if not vehicle or not vehicle.Parent then return end
 	setVehicleAnchored(vehicle, trailer, false)
@@ -463,31 +498,36 @@ local function teleportTruckAndTrailer(targetCFrame, waitForStreamPos, flipYaw)
 	local currentPos = (vehicle and vehicle:GetPivot().Position) or (char and char:GetPivot().Position) or destPos
 	local distToTarget = (currentPos - destPos).Magnitude
 
+	-- ล็อกรถและยกขึ้นสูงระดับปลอดภัย (+65 Studs) ก่อนโหลดแมพ ป้องกันตึกโหลดมาชนพ่วงหลุด
+	if vehicle and vehicle.Parent then
+		local safeSkyCF = CFrame.new(destPos.X, math.max(destPos.Y + 65, 120), destPos.Z)
+		zeroVelocity(vehicle)
+		if trailer then zeroVelocity(trailer) end
+		vehicle:PivotTo(safeSkyCF)
+		if trailer and trailer.Parent then
+			trailer:PivotTo(safeSkyCF * RUNTIME.trailerRelativeCF)
+		end
+		setVehicleAnchored(vehicle, trailer, true)
+	end
+
 	if distToTarget > 1800 then
 		local midPos = currentPos:Lerp(destPos, 0.5)
 		RUNTIME.statusText = string.format("โหลดแมพ (%d m)", math.floor(distToTarget))
-		safeRequestStream(midPos, 1.2)
+		safeRequestStream(midPos, 1.0)
 	end
 
-	safeRequestStream(destPos, 2.0)
+	safeRequestStream(destPos, 1.8)
 
 	if vehicle and vehicle.Parent then
-		local streamWait = os.clock() + 2.2
+		local streamWait = os.clock() + 2.0
 		while os.clock() < streamWait do
 			if isValidPart(getDeliveryLocationPart(destPos, CONFIG.ExactPadRadius)) then
 				break
 			end
-			-- ย้ายรถไปลอยรอเหนือจุดหมายโดยไม่ต้องล็อก Anchored ค้างนาน
-			local hoverCF = CFrame.new(destPos + Vector3.new(0, 18, 0))
-			vehicle:PivotTo(hoverCF)
-			if trailer and trailer.Parent then
-				trailer:PivotTo(hoverCF * RUNTIME.trailerRelativeCF)
-			end
-			zeroVelocity(vehicle)
-			if trailer then zeroVelocity(trailer) end
-			task.wait(0.1)
+			task.wait(0.08)
 		end
 
+		setVehicleAnchored(vehicle, trailer, false)
 		local streamedPart = getDeliveryLocationPart(destPos, CONFIG.ExactPadRadius)
 			or getDeliveryLocationPart(destPos, CONFIG.FallbackPadRadius)
 		local finalTargetCF = isValidPart(streamedPart) and streamedPart.CFrame or CFrame.new(destPos)
@@ -501,11 +541,11 @@ local function teleportTruckAndTrailer(targetCFrame, waitForStreamPos, flipYaw)
 	return nil
 end
 
-local function setupTruckAndTrailer()
-	if not CONFIG.AutoSpawnSetup then return end
+local function setupTruckAndTrailer(forceRespawn)
+	if not CONFIG.AutoSpawnSetup and not forceRespawn then return end
 	local vehicle = getMyVehicle()
 
-	if not vehicle or not vehicle.Parent or vehicle:GetAttribute("VehicleId") ~= CONFIG.TruckId then
+	if forceRespawn or not vehicle or not vehicle.Parent or vehicle:GetAttribute("VehicleId") ~= CONFIG.TruckId then
 		RUNTIME.statusText = "เสกรถบรรทุก"
 		local args = {
 			[1] = "Spawn",
@@ -521,7 +561,7 @@ local function setupTruckAndTrailer()
 			task.wait(0.15)
 			vehicle = getMyVehicle()
 		until (vehicle and vehicle:FindFirstChild("Weight")) or os.clock() > timeout
-		task.wait(0.5)
+		task.wait(0.45)
 	end
 
 	if vehicle then
@@ -538,18 +578,12 @@ local function setupTruckAndTrailer()
 		repeat
 			task.wait(0.15)
 		until isTrailerAttached(vehicle) or os.clock() > timeout
-		task.wait(0.4)
+		task.wait(0.35)
+	end
 
-		-- บันทึกตำแหน่งพ่วงสัมพัทธ์กับตัวรถตอนเสกเสร็จใหม่ๆ เพื่อไม่ให้ข้อต่อพ่วงบิดตอนวาร์ป
-		local trailer = TowablesController.GetAttachedTrailer()
-		if vehicle and trailer and trailer.Parent then
-			pcall(function()
-				local rel = vehicle:GetPivot():ToObjectSpace(trailer:GetPivot())
-				if rel.Position.Magnitude >= 12 and rel.Position.Magnitude <= 35 then
-					RUNTIME.trailerRelativeCF = CFrame.new(0, rel.Position.Y, rel.Position.Z)
-				end
-			end)
-		end
+	local trailer = TowablesController.GetAttachedTrailer()
+	if vehicle and trailer then
+		updateTrailerRelativeOffset(vehicle, trailer)
 	end
 end
 
@@ -574,14 +608,14 @@ local function getDeliveryMetrics(state)
 	return RUNTIME.carried, RUNTIME.maxCap, remAtPickup ~= nil and tonumber(remAtPickup) or nil
 end
 
-local function ensureDeliveryJobStarted()
+local function ensureDeliveryJobStarted(forceRestart)
 	local state = DeliveryJobTask.GetCurrentDeliveryState()
 	local carried = getDeliveryMetrics(state)
 
-	local needInitialHighRisk = (not RUNTIME.hasEnforcedHighRisk and JobsUtil.DoesPlayerHaveJob(LocalPlayer, JobsConstants.JobIds.Delivery) and carried == 0 and RUNTIME.deliveriesDone == 0)
+	local needInitialHighRisk = forceRestart or (not RUNTIME.hasEnforcedHighRisk and JobsUtil.DoesPlayerHaveJob(LocalPlayer, JobsConstants.JobIds.Delivery) and carried == 0 and RUNTIME.deliveriesDone == 0)
 
-	if needInitialHighRisk then
-		RUNTIME.statusText = "ตั้งค่าโหมด HighRisk เริ่มต้น"
+	if needInitialHighRisk and JobsUtil.DoesPlayerHaveJob(LocalPlayer, JobsConstants.JobIds.Delivery) then
+		RUNTIME.statusText = "รีเซ็ตโหมด HighRisk"
 		pcall(function()
 			JobsController.RequestEndJobSession("jobPad")
 		end)
@@ -590,7 +624,7 @@ local function ensureDeliveryJobStarted()
 	end
 
 	if not JobsUtil.DoesPlayerHaveJob(LocalPlayer, JobsConstants.JobIds.Delivery) then
-		RUNTIME.statusText = "เริ่มงานส่งของ"
+		RUNTIME.statusText = "เริ่มงานส่งของ (HighRisk)"
 		pcall(function()
 			Remotes.fireServer(
 				JobsConstants.Remotes.RequestStartJobSession,
@@ -599,43 +633,32 @@ local function ensureDeliveryJobStarted()
 				CONFIG.DeliveryMode
 			)
 		end)
+		if DeliveryConstants.RemoteEvents and DeliveryConstants.RemoteEvents.SetDeliveryMode then
+			pcall(function()
+				Remotes.fireServer(DeliveryConstants.RemoteEvents.SetDeliveryMode, CONFIG.DeliveryMode)
+			end)
+		end
 		RUNTIME.hasEnforcedHighRisk = true
 		RUNTIME.isDeliveringLatch = false
 		task.wait(1.0)
 	else
 		RUNTIME.hasEnforcedHighRisk = true
 	end
-
-	if carried == 0 and DeliveryConstants.RemoteEvents and DeliveryConstants.RemoteEvents.SetDeliveryMode then
-		pcall(function()
-			Remotes.fireServer(DeliveryConstants.RemoteEvents.SetDeliveryMode, CONFIG.DeliveryMode)
-		end)
-	end
 end
 
--- ================= ฟังก์ชันเสริม: Boost FPS & ย้ายเซิร์ฟคนน้อย =================
+-- ================= ฟังก์ชัน Boost FPS (ปลอด Memory Leak สำหรับแมพ StreamingEnabled) =================
 local isFpsBoosted = false
 local function runExtremeFPSBooster()
 	if isFpsBoosted then return end
 	isFpsBoosted = true
 
 	local Terrain = Workspace:FindFirstChildOfClass("Terrain")
-	local BoostConfig = {
-		RemoveParticles = true,      -- ปิดควัน ไฟ แสงสกิล Trail Beam
-		RemoveDecals = true,         -- ซ่อนรูปภาพแปะพื้นผิว
-		RemoveMeshTextures = true,   -- ลบสีพื้นผิวโมเดล 3D และ PBR (ลดภาระการ์ดจอหนักมาก)
-		DisablePointLights = true,   -- ปิดไฟหลอดเล็กๆ ตามแมพ
-		RemoveClothes = true,        -- ลบเสื้อผ้าและเครื่องประดับตัวละครในเซิร์ฟ
-		AutoOptimizeNewItems = true  -- ดักจับและลดกราฟิกของที่เกิดใหม่ตลอดเวลา
-	}
 
-	-- 1. ปรับแต่งระดับ Engine และ Quality
 	pcall(function()
 		settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
 		settings().Rendering.MeshPartDetailLevel = Enum.MeshPartDetailLevel.Level04
 	end)
 
-	-- 2. ปิดระบบแสงและเงาขั้นสูง (ใช้ sethiddenproperty สำหรับ Executor ที่รองรับ)
 	Lighting.GlobalShadows = false
 	Lighting.FogEnd = 9e9
 	Lighting.ShadowSoftness = 0
@@ -649,88 +672,62 @@ local function runExtremeFPSBooster()
 		end
 	end
 
-	-- 3. ลบ Material พิเศษของแมพ
 	for _, v in ipairs(MaterialService:GetChildren()) do
 		v:Destroy()
 	end
 	MaterialService.Use2022Materials = false
 
-	-- 4. ปิดเอฟเฟกต์น้ำและหญ้า 3D
 	if Terrain then
 		Terrain.WaterWaveSize = 0
 		Terrain.WaterWaveSpeed = 0
 		Terrain.WaterTransparency = 1
 		Terrain.WaterReflectance = 0
 		pcall(function()
-			sethiddenproperty(Terrain, "Decoration", false) -- ปิดหญ้า 3D ที่ขยับได้
+			sethiddenproperty(Terrain, "Decoration", false)
 		end)
 	end
 
-	-- 5. ฟังก์ชันจัดการวัตถุแต่ละชิ้น (แยก if ไม่ให้ทับซ้อนกัน)
 	local function optimizeInstance(v)
 		if v:IsA("BasePart") then
 			v.Material = Enum.Material.SmoothPlastic
 			v.Reflectance = 0
-			v.CastShadow = false -- สำคัญมาก: ปิดการคำนวณเงาของแต่ละชิ้น
+			v.CastShadow = false
 		end
-
 		if v:IsA("MeshPart") then
-			if BoostConfig.RemoveMeshTextures then
-				v.TextureID = ""
-			end
-			pcall(function()
-				sethiddenproperty(v, "RenderFidelity", Enum.RenderFidelity.Performance)
-			end)
-		elseif v:IsA("SpecialMesh") and BoostConfig.RemoveMeshTextures then
+			v.TextureID = ""
+		elseif v:IsA("SpecialMesh") then
 			v.TextureId = ""
-		elseif v:IsA("SurfaceAppearance") and BoostConfig.RemoveMeshTextures then
-			v:Destroy() -- ลบพื้นผิว PBR ที่กิน GPU สูง
-		elseif (v:IsA("Decal") or v:IsA("Texture")) and BoostConfig.RemoveDecals then
+		elseif v:IsA("SurfaceAppearance") then
+			v:Destroy()
+		elseif v:IsA("Decal") or v:IsA("Texture") then
 			v.Transparency = 1
-		elseif (v:IsA("ParticleEmitter") or v:IsA("Trail") or v:IsA("Beam") or v:IsA("Fire") or v:IsA("Smoke") or v:IsA("Sparkles")) and BoostConfig.RemoveParticles then
+		elseif v:IsA("ParticleEmitter") or v:IsA("Trail") or v:IsA("Beam") or v:IsA("Fire") or v:IsA("Smoke") or v:IsA("Sparkles") then
 			v.Enabled = false
-		elseif v:IsA("Explosion") and BoostConfig.RemoveParticles then
-			v.BlastPressure = 1
-			v.BlastRadius = 1
-			v.Visible = false
-		elseif (v:IsA("PointLight") or v:IsA("SpotLight") or v:IsA("SurfaceLight")) and BoostConfig.DisablePointLights then
+		elseif v:IsA("PointLight") or v:IsA("SpotLight") or v:IsA("SurfaceLight") then
 			v.Enabled = false
 			v.Shadows = false
-		elseif BoostConfig.RemoveClothes and (v:IsA("Clothing") or v:IsA("SurfaceGui") or v:IsA("ShirtGraphic")) then
-			v:Destroy()
 		end
 	end
 
-	-- 6. ล้างทั้งแมพแบบแบ่งจังหวะ (Batching) ป้องกันอาการเกมค้างตอนกดรัน
+	-- ล้างเฉพาะรอบแรกโดยไม่ผูก Workspace.DescendantAdded เพื่อป้องกัน Thread ทะลักตอนวาร์ปโหลดแมพ
 	task.spawn(function()
 		local descendants = Workspace:GetDescendants()
 		for i = 1, #descendants do
 			optimizeInstance(descendants[i])
-			-- พักทุกๆ 750 ชิ้น เพื่อไม่ให้เฟรมเรตตกวูบจนเกมหลุด
-			if i % 750 == 0 then
+			if i % 1000 == 0 then
 				task.wait()
 			end
 		end
-		print("🚀 Extreme FPS Booster V2: เคลียร์แมพเสร็จสมบูรณ์ (" .. #descendants .. " ชิ้น)!")
 	end)
 
-	-- 7. ดักจับของที่เพิ่งเกิดใหม่ในเกม (เช่น สกิลคนอื่น มอนสเตอร์เกิดใหม่)
-	if BoostConfig.AutoOptimizeNewItems then
-		Workspace.DescendantAdded:Connect(function(v)
-			task.defer(optimizeInstance, v)
-		end)
-	end
-
-	-- 8. ปลดล็อก FPS และเคลียร์ขยะใน Memory เบื้องต้น
 	pcall(function()
 		if setfpscap then
-			setfpscap(999)
+			setfpscap(120)
 		end
 	end)
 end
 
 local function hopToLowServer(btn)
-	print("กำลังค้นหาเซิร์ฟเวอร์คนน้อย...")
 	if btn and btn.Parent then btn.Text = "กำลังค้นหา..." end
 
 	local success, result = pcall(function()
@@ -740,18 +737,14 @@ local function hopToLowServer(btn)
 
 	if success and result and result.data then
 		for _, server in ipairs(result.data) do
-			-- เช็คว่าเป็นคนละห้องกับห้องปัจจุบัน และห้องไม่เต็ม
 			if server.id ~= game.JobId and server.playing < server.maxPlayers then
-				print("กำลังย้ายไปเซิร์ฟเวอร์ผู้เล่น: " .. server.playing .. "/" .. server.maxPlayers)
 				if btn and btn.Parent then btn.Text = "กำลังย้าย..." end
 				TeleportService:TeleportToPlaceInstance(game.PlaceId, server.id, LocalPlayer)
 				return
 			end
 		end
-		warn("ไม่พบเซิร์ฟเวอร์อื่นที่ว่างในขณะนี้")
 		if btn and btn.Parent then btn.Text = "ไม่พบเซิฟว่าง" end
 	else
-		warn("ไม่สามารถดึงข้อมูลเซิร์ฟเวอร์ได้")
 		if btn and btn.Parent then btn.Text = "ดึงข้อมูลล้มเหลว" end
 	end
 
@@ -837,7 +830,7 @@ local TitleLabel = Instance.new("TextLabel")
 TitleLabel.Size = UDim2.new(1, -80, 1, 0)
 TitleLabel.Position = UDim2.fromOffset(14, 0)
 TitleLabel.BackgroundTransparency = 1
-TitleLabel.Text = "Auto Delivery (Smooth Sync 24H)"
+TitleLabel.Text = "Auto Delivery (Anti-Lag & Anti-Reset V3)"
 TitleLabel.TextColor3 = Color3.fromRGB(240, 245, 255)
 TitleLabel.Font = Enum.Font.GothamBold
 TitleLabel.TextSize = 13
@@ -1027,7 +1020,7 @@ end)
 addButton("เสกรถและพ่วง", "เสกใหม่", function(btn)
 	btn.Text = "กำลังเสก"
 	task.spawn(function()
-		setupTruckAndTrailer()
+		setupTruckAndTrailer(true)
 		if btn and btn.Parent then btn.Text = "เสกใหม่" end
 	end)
 end)
@@ -1035,16 +1028,12 @@ end)
 addButton("รีเซ็ตอาชีพใหม่", "รีเซ็ต", function(btn)
 	btn.Text = "รอสักครู่"
 	task.spawn(function()
-		pcall(function() JobsController.RequestEndJobSession("jobPad") end)
-		RUNTIME.hasEnforcedHighRisk = false
-		RUNTIME.isDeliveringLatch = false
-		task.wait(0.8)
-		ensureDeliveryJobStarted()
+		ensureDeliveryJobStarted(true)
 		if btn and btn.Parent then btn.Text = "รีเซ็ต" end
 	end)
 end)
 
-addButton("ลดกราฟิกเพิ่มเฟรมเรต (Potato V2)", "Boost FPS", function(btn)
+addButton("ลดกราฟิกเพิ่มเฟรมเรต (Potato V3)", "Boost FPS", function(btn)
 	if isFpsBoosted then
 		btn.Text = "เปิดใช้งานแล้ว"
 		return
@@ -1107,7 +1096,7 @@ task.spawn(function()
 				end
 			end)
 
-			if (os.clock() - lastInputSim) >= 20 then
+			if (os.clock() - lastInputSim) >= 25 then
 				lastInputSim = os.clock()
 				pcall(function()
 					VirtualUser:CaptureController()
@@ -1156,7 +1145,7 @@ task.spawn(function()
 			mins,
 			secs
 		)
-		task.wait(0.25)
+		task.wait(0.35)
 	end
 end)
 
@@ -1171,14 +1160,23 @@ task.spawn(function()
 		local success, err = pcall(function()
 			local vehicle = getMyVehicle()
 			if not vehicle or not isTrailerAttached(vehicle) then
-				setupTruckAndTrailer()
+				setupTruckAndTrailer(false)
 				vehicle = getMyVehicle()
 			end
 			if vehicle then
 				ensurePlayerSeated(vehicle)
 			end
 
-			ensureDeliveryJobStarted()
+			ensureDeliveryJobStarted(false)
+
+			-- ถ้ารอบฟาร์มค้างติด Timeout ติดต่อกันเกิน 2 ครั้ง ให้ล้างสถานะงานและเสกพ่วงเช็คใหม่ทันที
+			if RUNTIME.consecutiveTimeouts >= 2 then
+				RUNTIME.consecutiveTimeouts = 0
+				RUNTIME.statusText = "ซ่อมแซมรอบงานที่ค้าง..."
+				ensureDeliveryJobStarted(true)
+				setupTruckAndTrailer(false)
+				task.wait(0.5)
+			end
 
 			local state = DeliveryJobTask.GetCurrentDeliveryState()
 
@@ -1193,8 +1191,7 @@ task.spawn(function()
 						task.wait(0.25)
 					end
 					DeliveryJobTask.InteractWithDeliveryLocation(startPart)
-					-- รอให้ State งานถูกสร้างขึ้นมาก่อน เพื่อไม่ให้วาร์ปซ้ำ
-					local waitStart = os.clock() + 2.5
+					local waitStart = os.clock() + 3.0
 					while Env.AutoDelivery and os.clock() < waitStart do
 						if DeliveryJobTask.GetCurrentDeliveryState() ~= nil then
 							break
@@ -1224,7 +1221,7 @@ task.spawn(function()
 				RUNTIME.isDeliveringLatch = true
 			end
 
-			-- ================= 1. โหมดไปจุดส่งของ (เข้าเมื่อมี DestinationPosition เท่านั้น) =================
+			-- ================= 1. โหมดไปจุดส่งของ =================
 			if RUNTIME.isDeliveringLatch and state.DestinationPosition ~= nil then
 				local destPos = state.DestinationPosition
 				RUNTIME.statusText = string.format("ไปจุดส่งของ (%d/%d)", carried, maxCap)
@@ -1232,7 +1229,6 @@ task.spawn(function()
 				local dropoffPart = getDeliveryLocationPart(destPos, CONFIG.ExactPadRadius)
 				local curVeh = getMyVehicle()
 
-				-- วาร์ปเฉพาะเมื่อรถยังไม่ได้อยู่ในวงกลมจุดส่งเท่านั้น!
 				if not curVeh or flatDistanceXZ(curVeh:GetPivot().Position, destPos) > CONFIG.InZoneRadiusXZ then
 					local targetCF = isValidPart(dropoffPart) and dropoffPart.CFrame or CFrame.new(destPos)
 					local streamedDrop = teleportTruckAndTrailer(targetCF, destPos, false)
@@ -1242,36 +1238,38 @@ task.spawn(function()
 					dropoffPart = dropoffPart or getDeliveryLocationPart(destPos, CONFIG.FallbackPadRadius)
 				end
 
-				if isValidPart(dropoffPart) then
+				if isValidPart(dropoffPart) and not state.IsDropping then
 					DeliveryJobTask.InteractWithDeliveryLocation(dropoffPart)
 				end
 
 				local lastDropCarried = carried
 				local lastProgressTime = os.clock()
 				local lastInteractTime = os.clock()
-				local dropTimeout = os.clock() + 28
+				local dropTimeout = os.clock() + 45
 				local flipDropYaw = false
+				local finishedDrop = false
 
 				while Env.AutoDelivery and Env.AutoDeliverySession == CurrentSessionId and os.clock() < dropTimeout do
 					dampSlidingIfNeeded()
 
 					local current = DeliveryJobTask.GetCurrentDeliveryState()
 					local curCarried, curMaxCap = getDeliveryMetrics(current)
-					RUNTIME.statusText = string.format("กำลังส่งของ (%d/%d)", curCarried, curMaxCap)
+					RUNTIME.statusText = string.format("กำลังส่งของ (%d/%d)%s", curCarried, curMaxCap, (current and current.IsDropping) and " [กำลังโหลด]" or "")
 
 					if not current or curCarried == 0 then
 						RUNTIME.deliveriesDone += 1
+						RUNTIME.consecutiveTimeouts = 0
 						RUNTIME.statusText = "ส่งของสำเร็จ"
 						RUNTIME.isDeliveringLatch = false
-						-- รอ 0.25 วินาทีให้เซิร์ฟเวอร์อัปเดตจุดรับรอบถัดไปให้เสร็จก่อน
-						task.wait(0.25)
+						finishedDrop = true
+						task.wait(0.3)
 						break
 					end
 
 					if curCarried < lastDropCarried then
 						lastDropCarried = curCarried
 						lastProgressTime = os.clock()
-						dropTimeout = os.clock() + 16
+						dropTimeout = os.clock() + 30
 					end
 
 					local curDestPos = current.DestinationPosition or destPos
@@ -1281,17 +1279,24 @@ task.spawn(function()
 					end
 
 					curVeh = getMyVehicle()
+					if not curVeh or not isTrailerAttached(curVeh) then
+						setupTruckAndTrailer(false)
+						curVeh = getMyVehicle()
+					end
+
 					if isValidPart(dropoffPart) and curVeh then
 						ensurePlayerSeated(curVeh)
+						local stallElapsed = os.clock() - lastProgressTime
 
-						-- ถ้ารถไหลหลุดออกจากวงเกิน 18 Studs ให้ดึงกลับเข้าวง
+						-- 1. ถ้ารถไหลหลุดออกจากวงเกิน 20 Studs ให้ดึงกลับเข้าวง
 						if flatDistanceXZ(curVeh:GetPivot().Position, dropoffPart.Position) > CONFIG.InZoneRadiusXZ then
 							teleportTruckAndTrailer(dropoffPart.CFrame, curDestPos, flipDropYaw)
 							task.wait(0.2)
 							lastInteractTime = os.clock()
 							DeliveryJobTask.InteractWithDeliveryLocation(dropoffPart)
-						-- ถ้าของไม่ลดเลยเกิน 5 วินาทีเต็ม ค่อยกลับหัวรถ 180 องศาเพื่อเปลี่ยนมุมบนเนิน
-						elseif (os.clock() - lastProgressTime) >= CONFIG.StallRetryTime then
+
+						-- 2. ปรับมุมรถเฉพาะเมื่อ "หลอดเหลืองไม่ได้หมุน" เกิน 7.5 วิ หรือค้างแข็งเกิน 16 วิ
+						elseif (not current.IsDropping and stallElapsed >= CONFIG.IdleRepositionTime) or (stallElapsed >= CONFIG.HardFreezeTime) then
 							lastProgressTime = os.clock()
 							flipDropYaw = not flipDropYaw
 							RUNTIME.statusText = "ปรับมุมรถบนเนินส่งของ..."
@@ -1299,8 +1304,9 @@ task.spawn(function()
 							task.wait(0.25)
 							lastInteractTime = os.clock()
 							DeliveryJobTask.InteractWithDeliveryLocation(dropoffPart)
-						-- ห้ามกดซ้ำเด็ดขาดถ้าหลอดกำลังหมุนอยู่ (current.IsDropping == true)
-						elseif not current.IsDropping and (os.clock() - lastInteractTime) >= 1.6 then
+
+						-- 3. กดรับ/ส่งเมื่อหลอดไม่ได้หมุนอยู่เท่านั้น
+						elseif not current.IsDropping and (os.clock() - lastInteractTime) >= 1.8 then
 							lastInteractTime = os.clock()
 							DeliveryJobTask.InteractWithDeliveryLocation(dropoffPart)
 						end
@@ -1314,7 +1320,11 @@ task.spawn(function()
 					task.wait(0.15)
 				end
 
-			-- ================= 2. โหมดไปจุดรับของ (และรอจนกว่าพิกัดจุดส่งจะมาครบ) =================
+				if not finishedDrop then
+					RUNTIME.consecutiveTimeouts += 1
+				end
+
+			-- ================= 2. โหมดไปจุดรับของ =================
 			elseif state.PickupPosition ~= nil then
 				local pickupPos = state.PickupPosition
 				RUNTIME.statusText = string.format("ไปจุดรับของ (%d/%d)", carried, maxCap)
@@ -1322,7 +1332,6 @@ task.spawn(function()
 				local pickupPart = getDeliveryLocationPart(pickupPos, CONFIG.ExactPadRadius)
 				local curVeh = getMyVehicle()
 
-				-- สำคัญที่สุด: ถ้ารถจอดอยู่ในวงรับของอยู่แล้ว ห้ามสั่งวาร์ปซ้ำเด็ดขาด!
 				if not curVeh or flatDistanceXZ(curVeh:GetPivot().Position, pickupPos) > CONFIG.InZoneRadiusXZ then
 					local targetCF = isValidPart(pickupPart) and pickupPart.CFrame or CFrame.new(pickupPos)
 					local streamedPick = teleportTruckAndTrailer(targetCF, pickupPos, false)
@@ -1339,9 +1348,10 @@ task.spawn(function()
 				local lastCarried = carried
 				local lastIncreaseTime = os.clock()
 				local lastInteractTime = os.clock()
-				local collectTimeout = os.clock() + 30
+				local collectTimeout = os.clock() + 45
 				local preStreamedDest = false
 				local flipPickupYaw = false
+				local finishedPickup = false
 
 				while Env.AutoDelivery and Env.AutoDeliverySession == CurrentSessionId and os.clock() < collectTimeout do
 					dampSlidingIfNeeded()
@@ -1350,12 +1360,12 @@ task.spawn(function()
 					if not current then break end
 
 					local curCarried, curMaxCap, curRem = getDeliveryMetrics(current)
-					RUNTIME.statusText = string.format("รับของขึ้นพ่วง (%d/%d)", curCarried, curMaxCap)
+					RUNTIME.statusText = string.format("รับของขึ้นพ่วง (%d/%d)%s", curCarried, curMaxCap, current.IsCollecting and " [กำลังโหลด]" or "")
 
 					if curCarried > lastCarried then
 						lastCarried = curCarried
 						lastIncreaseTime = os.clock()
-						collectTimeout = os.clock() + 18
+						collectTimeout = os.clock() + 30
 					end
 
 					if not preStreamedDest and curCarried >= (curMaxCap - 1) and current.DestinationPosition then
@@ -1370,11 +1380,19 @@ task.spawn(function()
 					local pickupDepleted = (curRem ~= nil and curRem <= 0 and curCarried > 0)
 					local noPickupPos = (curCarried > 0 and current.PickupPosition == nil)
 
-					-- ต้องทั้งของครบ (fullNow / pickupDepleted / noPickupPos) และเซิร์ฟเวอร์ส่ง DestinationPosition มาแล้วเท่านั้น ถึงจะออกจากจุดรับ!
 					if (fullNow or pickupDepleted or noPickupPos) and current.DestinationPosition ~= nil then
 						RUNTIME.isDeliveringLatch = true
-						task.wait(0.2) -- รอให้เซิร์ฟเวอร์ปิดสถานะจุดรับให้สมบูรณ์ก่อนวาร์ปออก
+						RUNTIME.consecutiveTimeouts = 0
+						finishedPickup = true
+						task.wait(0.2)
 						break
+					end
+
+					-- ถ้ารับของเต็มแล้วแต่รอเซิร์ฟเวอร์ส่งพิกัดจุดส่ง ให้ยืดเวลารอโดยห้ามวาร์ปซ้ำ
+					if fullNow or pickupDepleted then
+						lastIncreaseTime = os.clock()
+						task.wait(0.15)
+						continue
 					end
 
 					local curPickPos = current.PickupPosition or pickupPos
@@ -1384,17 +1402,24 @@ task.spawn(function()
 					end
 
 					curVeh = getMyVehicle()
+					if not curVeh or not isTrailerAttached(curVeh) then
+						setupTruckAndTrailer(false)
+						curVeh = getMyVehicle()
+					end
+
 					if isValidPart(pickupPart) and curVeh then
 						ensurePlayerSeated(curVeh)
+						local stallElapsed = os.clock() - lastIncreaseTime
 
-						-- ถ้ารถไหลออกจากวงเกิน 18 Studs ค่อยดึงกลับเข้าวง
+						-- 1. ถ้ารถไหลออกจากวงเกิน 20 Studs ค่อยดึงกลับเข้าวง
 						if flatDistanceXZ(curVeh:GetPivot().Position, pickupPart.Position) > CONFIG.InZoneRadiusXZ then
 							teleportTruckAndTrailer(pickupPart.CFrame, curPickPos, flipPickupYaw)
 							task.wait(0.2)
 							lastInteractTime = os.clock()
 							DeliveryJobTask.InteractWithDeliveryLocation(pickupPart)
-						-- ถ้าของไม่เพิ่มเกิน 5 วินาทีเต็ม ค่อยปรับมุมรถใหม่
-						elseif (os.clock() - lastIncreaseTime) >= CONFIG.StallRetryTime then
+
+						-- 2. ปรับมุมรถเฉพาะเมื่อ "หลอดเหลืองไม่ได้หมุน" เกิน 7.5 วิ หรือค้างแข็งเกิน 16 วิ
+						elseif (not current.IsCollecting and stallElapsed >= CONFIG.IdleRepositionTime) or (stallElapsed >= CONFIG.HardFreezeTime) then
 							lastIncreaseTime = os.clock()
 							flipPickupYaw = not flipPickupYaw
 							RUNTIME.statusText = "ปรับมุมรถจุดรับของ..."
@@ -1402,8 +1427,9 @@ task.spawn(function()
 							task.wait(0.25)
 							lastInteractTime = os.clock()
 							DeliveryJobTask.InteractWithDeliveryLocation(pickupPart)
-						-- ห้ามกดซ้ำถ้าหลอดรับของกำลังหมุนอยู่ (current.IsCollecting == true)
-						elseif not current.IsCollecting and (os.clock() - lastInteractTime) >= 1.6 then
+
+						-- 3. ห้ามกดซ้ำถ้าหลอดรับของกำลังหมุนอยู่
+						elseif not current.IsCollecting and (os.clock() - lastInteractTime) >= 1.8 then
 							lastInteractTime = os.clock()
 							DeliveryJobTask.InteractWithDeliveryLocation(pickupPart)
 						end
@@ -1416,6 +1442,10 @@ task.spawn(function()
 					end
 					task.wait(0.15)
 				end
+
+				if not finishedPickup then
+					RUNTIME.consecutiveTimeouts += 1
+				end
 			end
 		end)
 
@@ -1426,6 +1456,6 @@ task.spawn(function()
 			setVehicleAnchored(v, t, false)
 			warn("[AutoDelivery Error]:", err)
 		end
-		task.wait(0.12)
+		task.wait(0.15)
 	end
 end)
