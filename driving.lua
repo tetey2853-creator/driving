@@ -6,6 +6,9 @@ local UserInputService = game:GetService("UserInputService")
 local VirtualUser = game:GetService("VirtualUser")
 local TeleportService = game:GetService("TeleportService")
 local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
+local MaterialService = game:GetService("MaterialService")
+local HttpService = game:GetService("HttpService")
 
 local VirtualInputManager = nil
 pcall(function()
@@ -610,6 +613,153 @@ local function ensureDeliveryJobStarted()
 	end
 end
 
+-- ================= ฟังก์ชันเสริม: Boost FPS & ย้ายเซิร์ฟคนน้อย =================
+local isFpsBoosted = false
+local function runExtremeFPSBooster()
+	if isFpsBoosted then return end
+	isFpsBoosted = true
+
+	local Terrain = Workspace:FindFirstChildOfClass("Terrain")
+	local BoostConfig = {
+		RemoveParticles = true,      -- ปิดควัน ไฟ แสงสกิล Trail Beam
+		RemoveDecals = true,         -- ซ่อนรูปภาพแปะพื้นผิว
+		RemoveMeshTextures = true,   -- ลบสีพื้นผิวโมเดล 3D และ PBR (ลดภาระการ์ดจอหนักมาก)
+		DisablePointLights = true,   -- ปิดไฟหลอดเล็กๆ ตามแมพ
+		RemoveClothes = true,        -- ลบเสื้อผ้าและเครื่องประดับตัวละครในเซิร์ฟ
+		AutoOptimizeNewItems = true  -- ดักจับและลดกราฟิกของที่เกิดใหม่ตลอดเวลา
+	}
+
+	-- 1. ปรับแต่งระดับ Engine และ Quality
+	pcall(function()
+		settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
+		settings().Rendering.MeshPartDetailLevel = Enum.MeshPartDetailLevel.Level04
+	end)
+
+	-- 2. ปิดระบบแสงและเงาขั้นสูง (ใช้ sethiddenproperty สำหรับ Executor ที่รองรับ)
+	Lighting.GlobalShadows = false
+	Lighting.FogEnd = 9e9
+	Lighting.ShadowSoftness = 0
+	pcall(function()
+		sethiddenproperty(Lighting, "Technology", Enum.Technology.Voxel)
+	end)
+
+	for _, v in ipairs(Lighting:GetChildren()) do
+		if v:IsA("PostEffect") or v:IsA("Sky") or v:IsA("Atmosphere") or v:IsA("Clouds") then
+			v:Destroy()
+		end
+	end
+
+	-- 3. ลบ Material พิเศษของแมพ
+	for _, v in ipairs(MaterialService:GetChildren()) do
+		v:Destroy()
+	end
+	MaterialService.Use2022Materials = false
+
+	-- 4. ปิดเอฟเฟกต์น้ำและหญ้า 3D
+	if Terrain then
+		Terrain.WaterWaveSize = 0
+		Terrain.WaterWaveSpeed = 0
+		Terrain.WaterTransparency = 1
+		Terrain.WaterReflectance = 0
+		pcall(function()
+			sethiddenproperty(Terrain, "Decoration", false) -- ปิดหญ้า 3D ที่ขยับได้
+		end)
+	end
+
+	-- 5. ฟังก์ชันจัดการวัตถุแต่ละชิ้น (แยก if ไม่ให้ทับซ้อนกัน)
+	local function optimizeInstance(v)
+		if v:IsA("BasePart") then
+			v.Material = Enum.Material.SmoothPlastic
+			v.Reflectance = 0
+			v.CastShadow = false -- สำคัญมาก: ปิดการคำนวณเงาของแต่ละชิ้น
+		end
+
+		if v:IsA("MeshPart") then
+			if BoostConfig.RemoveMeshTextures then
+				v.TextureID = ""
+			end
+			pcall(function()
+				sethiddenproperty(v, "RenderFidelity", Enum.RenderFidelity.Performance)
+			end)
+		elseif v:IsA("SpecialMesh") and BoostConfig.RemoveMeshTextures then
+			v.TextureId = ""
+		elseif v:IsA("SurfaceAppearance") and BoostConfig.RemoveMeshTextures then
+			v:Destroy() -- ลบพื้นผิว PBR ที่กิน GPU สูง
+		elseif (v:IsA("Decal") or v:IsA("Texture")) and BoostConfig.RemoveDecals then
+			v.Transparency = 1
+		elseif (v:IsA("ParticleEmitter") or v:IsA("Trail") or v:IsA("Beam") or v:IsA("Fire") or v:IsA("Smoke") or v:IsA("Sparkles")) and BoostConfig.RemoveParticles then
+			v.Enabled = false
+		elseif v:IsA("Explosion") and BoostConfig.RemoveParticles then
+			v.BlastPressure = 1
+			v.BlastRadius = 1
+			v.Visible = false
+		elseif (v:IsA("PointLight") or v:IsA("SpotLight") or v:IsA("SurfaceLight")) and BoostConfig.DisablePointLights then
+			v.Enabled = false
+			v.Shadows = false
+		elseif BoostConfig.RemoveClothes and (v:IsA("Clothing") or v:IsA("SurfaceGui") or v:IsA("ShirtGraphic")) then
+			v:Destroy()
+		end
+	end
+
+	-- 6. ล้างทั้งแมพแบบแบ่งจังหวะ (Batching) ป้องกันอาการเกมค้างตอนกดรัน
+	task.spawn(function()
+		local descendants = Workspace:GetDescendants()
+		for i = 1, #descendants do
+			optimizeInstance(descendants[i])
+			-- พักทุกๆ 750 ชิ้น เพื่อไม่ให้เฟรมเรตตกวูบจนเกมหลุด
+			if i % 750 == 0 then
+				task.wait()
+			end
+		end
+		print("🚀 Extreme FPS Booster V2: เคลียร์แมพเสร็จสมบูรณ์ (" .. #descendants .. " ชิ้น)!")
+	end)
+
+	-- 7. ดักจับของที่เพิ่งเกิดใหม่ในเกม (เช่น สกิลคนอื่น มอนสเตอร์เกิดใหม่)
+	if BoostConfig.AutoOptimizeNewItems then
+		Workspace.DescendantAdded:Connect(function(v)
+			task.defer(optimizeInstance, v)
+		end)
+	end
+
+	-- 8. ปลดล็อก FPS และเคลียร์ขยะใน Memory เบื้องต้น
+	pcall(function()
+		if setfpscap then
+			setfpscap(999)
+		end
+	end)
+end
+
+local function hopToLowServer(btn)
+	print("กำลังค้นหาเซิร์ฟเวอร์คนน้อย...")
+	if btn and btn.Parent then btn.Text = "กำลังค้นหา..." end
+
+	local success, result = pcall(function()
+		local url = "https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100"
+		return HttpService:JSONDecode(game:HttpGet(url))
+	end)
+
+	if success and result and result.data then
+		for _, server in ipairs(result.data) do
+			-- เช็คว่าเป็นคนละห้องกับห้องปัจจุบัน และห้องไม่เต็ม
+			if server.id ~= game.JobId and server.playing < server.maxPlayers then
+				print("กำลังย้ายไปเซิร์ฟเวอร์ผู้เล่น: " .. server.playing .. "/" .. server.maxPlayers)
+				if btn and btn.Parent then btn.Text = "กำลังย้าย..." end
+				TeleportService:TeleportToPlaceInstance(game.PlaceId, server.id, LocalPlayer)
+				return
+			end
+		end
+		warn("ไม่พบเซิร์ฟเวอร์อื่นที่ว่างในขณะนี้")
+		if btn and btn.Parent then btn.Text = "ไม่พบเซิฟว่าง" end
+	else
+		warn("ไม่สามารถดึงข้อมูลเซิร์ฟเวอร์ได้")
+		if btn and btn.Parent then btn.Text = "ดึงข้อมูลล้มเหลว" end
+	end
+
+	task.delay(1.5, function()
+		if btn and btn.Parent then btn.Text = "ย้ายเซิฟ" end
+	end)
+end
+
 -- ================= UI =================
 local OldGui = PlayerGui:FindFirstChild("DE_AutoDelivery_UI")
 if OldGui then
@@ -891,6 +1041,27 @@ addButton("รีเซ็ตอาชีพใหม่", "รีเซ็ต",
 		task.wait(0.8)
 		ensureDeliveryJobStarted()
 		if btn and btn.Parent then btn.Text = "รีเซ็ต" end
+	end)
+end)
+
+addButton("ลดกราฟิกเพิ่มเฟรมเรต (Potato V2)", "Boost FPS", function(btn)
+	if isFpsBoosted then
+		btn.Text = "เปิดใช้งานแล้ว"
+		return
+	end
+	btn.Text = "กำลังเคลียร์..."
+	task.spawn(function()
+		runExtremeFPSBooster()
+		if btn and btn.Parent then
+			btn.Text = "เปิดใช้งานแล้ว"
+			btn.BackgroundColor3 = Color3.fromRGB(0, 160, 110)
+		end
+	end)
+end)
+
+addButton("ย้ายไปเซิร์ฟเวอร์คนน้อย", "ย้ายเซิฟ", function(btn)
+	task.spawn(function()
+		hopToLowServer(btn)
 	end)
 end)
 
