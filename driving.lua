@@ -1,8 +1,3 @@
--- ==============================================================================
--- Tetekubb Hub | Auto Delivery + Extreme FPS Booster V2 + Low Server Hop
--- UI Library: Obsidian (Modified LinoriaLib)
--- ==============================================================================
-
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local CollectionService = game:GetService("CollectionService")
@@ -10,11 +5,7 @@ local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local VirtualUser = game:GetService("VirtualUser")
 local TeleportService = game:GetService("TeleportService")
-local HttpService = game:GetService("HttpService")
-local Lighting = game:GetService("Lighting")
 local Workspace = game:GetService("Workspace")
-local MaterialService = game:GetService("MaterialService")
-local Terrain = Workspace:FindFirstChildOfClass("Terrain")
 
 local VirtualInputManager = nil
 pcall(function()
@@ -22,6 +13,7 @@ pcall(function()
 end)
 
 local LocalPlayer = Players.LocalPlayer
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui")
 local RemotesFolder = ReplicatedStorage:WaitForChild("Remotes")
 
 local function safeRequire(mod)
@@ -66,15 +58,6 @@ local CONFIG = {
 	AntiAFK = true,
 }
 
-local FPS_CONFIG = {
-	RemoveParticles = true,      -- ปิดควัน ไฟ แสงสกิล Trail Beam
-	RemoveDecals = true,         -- ซ่อนรูปภาพแปะพื้นผิว
-	RemoveMeshTextures = true,   -- ลบสีพื้นผิวโมเดล 3D และ PBR (ลดภาระการ์ดจอหนักมาก)
-	DisablePointLights = true,   -- ปิดไฟหลอดเล็กๆ ตามแมพ
-	RemoveClothes = true,        -- ลบเสื้อผ้าและเครื่องประดับตัวละครในเซิร์ฟ
-	AutoOptimizeNewItems = true, -- ดักจับและลดกราฟิกของที่เกิดใหม่ตลอดเวลา
-}
-
 local RUNTIME = {
 	isDeliveringLatch = false,
 	hasEnforcedHighRisk = false,
@@ -85,187 +68,8 @@ local RUNTIME = {
 	startCash = nil,
 	sessionStart = os.clock(),
 	trailerRelativeCF = CFrame.new(0, 0, 23), -- เก็บ CFrame สัมพัทธ์จริงระหว่างรถกับพ่วง
-	fpsDescendantConn = nil,
 }
 
--- ==============================================================================
--- โหลด Obsidian UI Library
--- ==============================================================================
-local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
-local Library = loadstring(game:HttpGet(repo .. "Library.lua"))()
-local ThemeManager = loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
-local SaveManager = loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))()
-
-local Options = Library.Options
-local Toggles = Library.Toggles
-
-Library.ForceCheckbox = false
-Library.ShowToggleFrameInKeybinds = true
-
--- ==============================================================================
--- ฟังก์ชันระบบ FPS Booster V2 & Server Hop
--- ==============================================================================
-local function optimizeInstance(v)
-	if v:IsA("BasePart") then
-		v.Material = Enum.Material.SmoothPlastic
-		v.Reflectance = 0
-		v.CastShadow = false
-	end
-
-	if v:IsA("MeshPart") then
-		if FPS_CONFIG.RemoveMeshTextures then
-			v.TextureID = ""
-		end
-		pcall(function()
-			sethiddenproperty(v, "RenderFidelity", Enum.RenderFidelity.Performance)
-		end)
-	elseif v:IsA("SpecialMesh") and FPS_CONFIG.RemoveMeshTextures then
-		v.TextureId = ""
-	elseif v:IsA("SurfaceAppearance") and FPS_CONFIG.RemoveMeshTextures then
-		v:Destroy()
-	elseif (v:IsA("Decal") or v:IsA("Texture")) and FPS_CONFIG.RemoveDecals then
-		v.Transparency = 1
-	elseif (v:IsA("ParticleEmitter") or v:IsA("Trail") or v:IsA("Beam") or v:IsA("Fire") or v:IsA("Smoke") or v:IsA("Sparkles")) and FPS_CONFIG.RemoveParticles then
-		v.Enabled = false
-	elseif v:IsA("Explosion") and FPS_CONFIG.RemoveParticles then
-		v.BlastPressure = 1
-		v.BlastRadius = 1
-		v.Visible = false
-	elseif (v:IsA("PointLight") or v:IsA("SpotLight") or v:IsA("SurfaceLight")) and FPS_CONFIG.DisablePointLights then
-		v.Enabled = false
-		v.Shadows = false
-	elseif FPS_CONFIG.RemoveClothes and (v:IsA("Clothing") or v:IsA("SurfaceGui") or v:IsA("ShirtGraphic")) then
-		v:Destroy()
-	end
-end
-
-local function runExtremeFPSBooster()
-	Library:Notify({
-		Title = "Tetekubb Hub - FPS Booster",
-		Description = "กำลังเริ่มเคลียร์กราฟิกและบูสต์ FPS...",
-		Time = 3,
-	})
-
-	-- 1. ปรับแต่งระดับ Engine และ Quality
-	pcall(function()
-		settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
-		settings().Rendering.MeshPartDetailLevel = Enum.MeshPartDetailLevel.Level04
-	end)
-
-	-- 2. ปิดระบบแสงและเงาขั้นสูง
-	Lighting.GlobalShadows = false
-	Lighting.FogEnd = 9e9
-	Lighting.ShadowSoftness = 0
-	pcall(function()
-		sethiddenproperty(Lighting, "Technology", Enum.Technology.Voxel)
-	end)
-
-	for _, v in ipairs(Lighting:GetChildren()) do
-		if v:IsA("PostEffect") or v:IsA("Sky") or v:IsA("Atmosphere") or v:IsA("Clouds") then
-			v:Destroy()
-		end
-	end
-
-	-- 3. ลบ Material พิเศษของแมพ
-	for _, v in ipairs(MaterialService:GetChildren()) do
-		v:Destroy()
-	end
-	MaterialService.Use2022Materials = false
-
-	-- 4. ปิดเอฟเฟกต์น้ำและหญ้า 3D
-	Terrain = Workspace:FindFirstChildOfClass("Terrain")
-	if Terrain then
-		Terrain.WaterWaveSize = 0
-		Terrain.WaterWaveSpeed = 0
-		Terrain.WaterTransparency = 1
-		Terrain.WaterReflectance = 0
-		pcall(function()
-			sethiddenproperty(Terrain, "Decoration", false)
-		end)
-	end
-
-	-- 5 & 6. ล้างทั้งแมพแบบแบ่งจังหวะ (Batching) ป้องกันอาการเกมค้างตอนกดรัน
-	task.spawn(function()
-		local descendants = Workspace:GetDescendants()
-		for i = 1, #descendants do
-			optimizeInstance(descendants[i])
-			if i % 750 == 0 then
-				task.wait()
-			end
-		end
-		print("🚀 Extreme FPS Booster V2: เคลียร์แมพเสร็จสมบูรณ์ (" .. #descendants .. " ชิ้น)!")
-		Library:Notify({
-			Title = "Tetekubb Hub - FPS Booster",
-			Description = "เคลียร์แมพเสร็จสมบูรณ์ (" .. #descendants .. " ชิ้น)!",
-			Time = 4,
-		})
-	end)
-
-	-- 7. ดักจับของที่เพิ่งเกิดใหม่ในเกม
-	if FPS_CONFIG.AutoOptimizeNewItems and not RUNTIME.fpsDescendantConn then
-		RUNTIME.fpsDescendantConn = Workspace.DescendantAdded:Connect(function(v)
-			if FPS_CONFIG.AutoOptimizeNewItems then
-				task.defer(optimizeInstance, v)
-			end
-		end)
-	end
-
-	-- 8. ปลดล็อก FPS
-	pcall(function()
-		if setfpscap then
-			setfpscap(999)
-		end
-	end)
-end
-
-local function hopLowPlayerServer()
-	print("กำลังค้นหาเซิร์ฟเวอร์คนน้อย...")
-	Library:Notify({
-		Title = "Tetekubb Hub - Server Hop",
-		Description = "กำลังค้นหาเซิร์ฟเวอร์คนน้อย...",
-		Time = 3,
-	})
-
-	task.spawn(function()
-		local success, result = pcall(function()
-			local url = "https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Asc&limit=100"
-			return HttpService:JSONDecode(game:HttpGet(url))
-		end)
-
-		if success and result and result.data then
-			for _, server in ipairs(result.data) do
-				if server.id ~= game.JobId and server.playing < server.maxPlayers then
-					local msg = "กำลังย้ายไปเซิร์ฟเวอร์ผู้เล่น: " .. server.playing .. "/" .. server.maxPlayers
-					print(msg)
-					Library:Notify({
-						Title = "Tetekubb Hub - Server Hop",
-						Description = msg,
-						Time = 5,
-					})
-					TeleportService:TeleportToPlaceInstance(game.PlaceId, server.id, LocalPlayer)
-					return
-				end
-			end
-			warn("ไม่พบเซิร์ฟเวอร์อื่นที่ว่างในขณะนี้")
-			Library:Notify({
-				Title = "Tetekubb Hub - Server Hop",
-				Description = "ไม่พบเซิร์ฟเวอร์อื่นที่ว่างในขณะนี้",
-				Time = 4,
-			})
-		else
-			warn("ไม่สามารถดึงข้อมูลเซิร์ฟเวอร์ได้")
-			Library:Notify({
-				Title = "Tetekubb Hub - Server Hop",
-				Description = "ไม่สามารถดึงข้อมูลเซิร์ฟเวอร์ได้",
-				Time = 4,
-			})
-		end
-	end)
-end
-
--- ==============================================================================
--- ฟังก์ชันระบบ Auto Delivery & Anti-AFK
--- ==============================================================================
 local function isValidPart(part)
 	return part ~= nil and typeof(part) == "Instance" and part.Parent ~= nil and part:IsDescendantOf(Workspace)
 end
@@ -276,6 +80,7 @@ local function flatDistanceXZ(posA, posB)
 	return math.sqrt(dx * dx + dz * dz)
 end
 
+-- โหลดแมพแบบไม่บล็อกลูปหลัก
 local function safeRequestStream(pos, timeoutWait)
 	if not pos then return end
 	local done = false
@@ -291,7 +96,7 @@ local function safeRequestStream(pos, timeoutWait)
 	end
 end
 
--- ระบบบล็อกการย้ายไปด่าน AFK ของเกม
+-- ================= ระบบบล็อกการย้ายไปด่าน AFK ของเกม =================
 local function isAFKTeleportCall(remoteName, ...)
 	local nameLower = tostring(remoteName):lower()
 	if nameLower:find("afk") then
@@ -454,6 +259,7 @@ local function setVehicleAnchored(vehicle, trailer, anchored)
 	end
 end
 
+-- กระตุ้นฟิสิกส์เบาๆ หลังวาร์ป เพื่อให้ Client ส่งแพ็กเก็ตอัปเดตตำแหน่งรถไปที่ Server ทันที (ป้องกันฟิสิกส์หลับ)
 local function wakeVehiclePhysics(vehicle, trailer)
 	if not vehicle or not vehicle.Parent then return end
 	setVehicleAnchored(vehicle, trailer, false)
@@ -475,6 +281,7 @@ local function wakeVehiclePhysics(vehicle, trailer)
 	end
 end
 
+-- ประคองรถไม่ให้ไหลตกเนินโดยไม่ทำให้ฟิสิกส์หลับ
 local function dampSlidingIfNeeded()
 	local vehicle = getMyVehicle()
 	local trailer = TowablesController.GetAttachedTrailer()
@@ -522,6 +329,7 @@ local function ensurePlayerSeated(vehicle)
 	return hum.SeatPart == seat
 end
 
+-- คำนวณ CFrame ให้ขนานไปกับความลาดชันของพื้นดิน (Slope-Aligned) เพื่อไม่ให้หางพ่วงจมเนินดิน
 local function getSlopeAlignedGroundCFrame(targetCF, ignoreList, flipYaw)
 	local pos = targetCF.Position
 	local _, yaw, _ = targetCF:ToEulerAnglesYXZ()
@@ -555,6 +363,7 @@ local function getSlopeAlignedGroundCFrame(targetCF, ignoreList, flipYaw)
 	local flatRot = CFrame.Angles(0, yaw, 0)
 	local lookVec = flatRot.LookVector
 
+	-- วัดความสูงพื้นตรงหน้ารถ (+5 Studs) และท้ายพ่วง (-18 Studs) เพื่อเอียงรถตามเนินดิน
 	local frontCheck = pos + (lookVec * 5)
 	local backCheck = pos - (lookVec * 18)
 	local centerY = castGround(pos)
@@ -565,6 +374,7 @@ local function getSlopeAlignedGroundCFrame(targetCF, ignoreList, flipYaw)
 	pitch = math.clamp(pitch, math.rad(-22), math.rad(22))
 
 	local baseHeight = math.max(centerY, (frontY + backY) * 0.5) + 2.8
+	-- ขยับหัวรถไปด้านหน้า 4 Studs เพื่อให้จุดกึ่งกลางรถและพ่วงอยู่ในวงกลมพอดี
 	return CFrame.new(pos.X, baseHeight, pos.Z) * CFrame.Angles(0, yaw, 0) * CFrame.Angles(pitch, 0, 0) * CFrame.new(0, 0, -4)
 end
 
@@ -611,6 +421,7 @@ local function getDeliveryLocationPart(targetPos, customRadius)
 	return fallbackPart or locations[1]
 end
 
+-- ย้ายรถและพ่วงด้วย Relative CFrame จริงตามแนวความชันของถนน
 local function pivotTruckAndTrailerAligned(vehicle, trailer, cabCF)
 	if not vehicle or not vehicle.Parent then return end
 	setVehicleAnchored(vehicle, trailer, false)
@@ -663,6 +474,7 @@ local function teleportTruckAndTrailer(targetCFrame, waitForStreamPos, flipYaw)
 			if isValidPart(getDeliveryLocationPart(destPos, CONFIG.ExactPadRadius)) then
 				break
 			end
+			-- ย้ายรถไปลอยรอเหนือจุดหมายโดยไม่ต้องล็อก Anchored ค้างนาน
 			local hoverCF = CFrame.new(destPos + Vector3.new(0, 18, 0))
 			vehicle:PivotTo(hoverCF)
 			if trailer and trailer.Parent then
@@ -725,6 +537,7 @@ local function setupTruckAndTrailer()
 		until isTrailerAttached(vehicle) or os.clock() > timeout
 		task.wait(0.4)
 
+		-- บันทึกตำแหน่งพ่วงสัมพัทธ์กับตัวรถตอนเสกเสร็จใหม่ๆ เพื่อไม่ให้ข้อต่อพ่วงบิดตอนวาร์ป
 		local trailer = TowablesController.GetAttachedTrailer()
 		if vehicle and trailer and trailer.Parent then
 			pcall(function()
@@ -797,288 +610,293 @@ local function ensureDeliveryJobStarted()
 	end
 end
 
--- ==============================================================================
--- สร้างหน้าต่าง UI (Obsidian Library - Tetekubb Hub)
--- ==============================================================================
-local OldGui = LocalPlayer:WaitForChild("PlayerGui"):FindFirstChild("DE_AutoDelivery_UI")
+-- ================= UI =================
+local OldGui = PlayerGui:FindFirstChild("DE_AutoDelivery_UI")
 if OldGui then
 	OldGui:Destroy()
 end
 
-local Window = Library:CreateWindow({
-	Title = "Tetekubb Hub",
-	Footer = "Auto Delivery & Utility | Smooth Sync 24H",
-	Icon = 95816097006870,
-	NotifySide = "Right",
-	ShowCustomCursor = false,
-})
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "DE_AutoDelivery_UI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.DisplayOrder = 999
+ScreenGui.Parent = PlayerGui
 
-local Tabs = {
-	Main = Window:AddTab("Main", "user"),
-	Utility = Window:AddTab("FPS & Server", "zap"),
-	["UI Settings"] = Window:AddTab("UI Settings", "settings"),
-}
+local FloatBtn = Instance.new("TextButton")
+FloatBtn.Size = UDim2.fromOffset(42, 42)
+FloatBtn.Position = UDim2.new(0, 18, 0.5, -21)
+FloatBtn.BackgroundColor3 = Color3.fromRGB(20, 22, 30)
+FloatBtn.Text = "UI"
+FloatBtn.TextSize = 13
+FloatBtn.Font = Enum.Font.GothamBold
+FloatBtn.TextColor3 = Color3.fromRGB(240, 245, 255)
+FloatBtn.Parent = ScreenGui
+Instance.new("UICorner", FloatBtn).CornerRadius = UDim.new(0, 8)
+local FloatStroke = Instance.new("UIStroke", FloatBtn)
+FloatStroke.Color = Color3.fromRGB(55, 65, 90)
+FloatStroke.Thickness = 1.5
 
--- ------------------------------------------------------------------------------
--- แท็บ Main: ควบคุมการฟาร์ม & แสดงสถานะ
--- ------------------------------------------------------------------------------
-local FarmGroupBox = Tabs.Main:AddLeftGroupbox("ระบบออโต้ส่งของ (Auto Delivery)")
-local StatusGroupBox = Tabs.Main:AddRightGroupbox("สถานะและผลกำไร (Live Status)")
-local QuickUtilGroupBox = Tabs.Main:AddRightGroupbox("ทางลัด (Quick Utility)")
+local MainFrame = Instance.new("Frame")
+MainFrame.Size = UDim2.fromOffset(400, 330)
+MainFrame.Position = UDim2.new(0.5, -200, 0.5, -165)
+MainFrame.BackgroundColor3 = Color3.fromRGB(15, 17, 24)
+MainFrame.BorderSizePixel = 0
+MainFrame.Parent = ScreenGui
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
+local MainStroke = Instance.new("UIStroke", MainFrame)
+MainStroke.Color = Color3.fromRGB(45, 55, 80)
+MainStroke.Thickness = 1.5
 
-FarmGroupBox:AddToggle("AutoDeliveryToggle", {
-	Text = "ออโต้ส่งของ (Auto Delivery)",
-	Default = Env.AutoDelivery,
-	Tooltip = "เปิด/ปิด ระบบขับรถรับ-ส่งของอัตโนมัติ",
-	Callback = function(val)
-		Env.AutoDelivery = val
-		if not val then
-			RUNTIME.statusText = "ปิดใช้งาน"
-			local v = getMyVehicle()
-			local t = TowablesController.GetAttachedTrailer()
-			setVehicleAnchored(v, t, false)
+local function makeDraggable(handle, frame)
+	local dragging, dragInput, dragStart, startPos
+	handle.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = frame.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then dragging = false end
+			end)
 		end
-	end,
-})
+	end)
+	handle.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			dragInput = input
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if input == dragInput and dragging then
+			local delta = input.Position - dragStart
+			frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		end
+	end)
+end
+makeDraggable(FloatBtn, FloatBtn)
 
-FarmGroupBox:AddToggle("AutoSpawnSetupToggle", {
-	Text = "เสกรถและพ่วงอัตโนมัติ",
-	Default = CONFIG.AutoSpawnSetup,
-	Tooltip = "เสกรถบรรทุกและพ่วงให้อัตโนมัติเมื่อรถหายหรือยังไม่ได้พ่วง",
-	Callback = function(val)
-		CONFIG.AutoSpawnSetup = val
-	end,
-})
+local TopBar = Instance.new("Frame")
+TopBar.Size = UDim2.new(1, 0, 0, 36)
+TopBar.BackgroundColor3 = Color3.fromRGB(22, 25, 36)
+TopBar.BorderSizePixel = 0
+TopBar.Parent = MainFrame
+Instance.new("UICorner", TopBar).CornerRadius = UDim.new(0, 10)
+makeDraggable(TopBar, MainFrame)
 
-FarmGroupBox:AddToggle("AntiAFKToggle", {
-	Text = "ป้องกันด่าน AFK (Anti-AFK)",
-	Default = CONFIG.AntiAFK,
-	Tooltip = "ป้องกันการถูกเตะหรือถูกย้ายไปแมพ AFK",
-	Callback = function(val)
-		CONFIG.AntiAFK = val
-	end,
-})
+local TitleLabel = Instance.new("TextLabel")
+TitleLabel.Size = UDim2.new(1, -80, 1, 0)
+TitleLabel.Position = UDim2.fromOffset(14, 0)
+TitleLabel.BackgroundTransparency = 1
+TitleLabel.Text = "Auto Delivery (Smooth Sync 24H)"
+TitleLabel.TextColor3 = Color3.fromRGB(240, 245, 255)
+TitleLabel.Font = Enum.Font.GothamBold
+TitleLabel.TextSize = 13
+TitleLabel.TextXAlignment = Enum.TextXAlignment.Left
+TitleLabel.Parent = TopBar
 
-FarmGroupBox:AddDivider()
+local MinBtn = Instance.new("TextButton")
+MinBtn.Size = UDim2.fromOffset(24, 22)
+MinBtn.Position = UDim2.new(1, -32, 0.5, -11)
+MinBtn.BackgroundColor3 = Color3.fromRGB(35, 40, 58)
+MinBtn.Text = "-"
+MinBtn.TextColor3 = Color3.fromRGB(210, 220, 240)
+MinBtn.Font = Enum.Font.GothamBold
+MinBtn.TextSize = 14
+MinBtn.Parent = TopBar
+Instance.new("UICorner", MinBtn).CornerRadius = UDim.new(0, 5)
 
-FarmGroupBox:AddButton({
-	Text = "บังคับไปจุดส่งทันที",
-	Tooltip = "สลับโหมดบังคับให้นำของที่มีอยู่ไปส่งทันที",
-	Func = function()
-		RUNTIME.isDeliveringLatch = true
-		Library:Notify({
-			Title = "Tetekubb Hub",
-			Description = "สลับเป็นโหมดไปจุดส่งทันทีแล้ว!",
-			Time = 2.5,
-		})
-	end,
-})
+local function toggleWindow()
+	MainFrame.Visible = not MainFrame.Visible
+end
+MinBtn.MouseButton1Click:Connect(toggleWindow)
+FloatBtn.MouseButton1Click:Connect(toggleWindow)
 
-FarmGroupBox:AddButton({
-	Text = "เสกรถและพ่วงใหม่",
-	Tooltip = "บังคับเสกรถบรรทุกและพ่วงหลังใหม่ทันที",
-	Func = function()
-		task.spawn(function()
-			Library:Notify({
-				Title = "Tetekubb Hub",
-				Description = "กำลังเสกรถและพ่วง...",
-				Time = 2.5,
-			})
-			setupTruckAndTrailer()
-		end)
-	end,
-})
+local StatusCard = Instance.new("Frame")
+StatusCard.Size = UDim2.new(1, -24, 0, 64)
+StatusCard.Position = UDim2.fromOffset(12, 44)
+StatusCard.BackgroundColor3 = Color3.fromRGB(21, 24, 34)
+StatusCard.Parent = MainFrame
+Instance.new("UICorner", StatusCard).CornerRadius = UDim.new(0, 8)
+local CardStroke = Instance.new("UIStroke", StatusCard)
+CardStroke.Color = Color3.fromRGB(45, 55, 80)
+CardStroke.Thickness = 1
 
-FarmGroupBox:AddButton({
-	Text = "รีเซ็ตอาชีพใหม่ (Reset Job)",
-	Tooltip = "ออกจากการทำงานปัจจุบันแล้วเริ่มงานโหมด HighRisk ใหม่",
-	Func = function()
-		task.spawn(function()
-			Library:Notify({
-				Title = "Tetekubb Hub",
-				Description = "กำลังรีเซ็ตอาชีพส่งของ...",
-				Time = 2.5,
-			})
-			pcall(function() JobsController.RequestEndJobSession("jobPad") end)
-			RUNTIME.hasEnforcedHighRisk = false
-			RUNTIME.isDeliveringLatch = false
-			task.wait(0.8)
-			ensureDeliveryJobStarted()
-		end)
-	end,
-})
+local StatusMainLabel = Instance.new("TextLabel")
+StatusMainLabel.Size = UDim2.new(1, -20, 0, 18)
+StatusMainLabel.Position = UDim2.fromOffset(10, 5)
+StatusMainLabel.BackgroundTransparency = 1
+StatusMainLabel.Text = "สถานะ: ปิดใช้งาน"
+StatusMainLabel.TextColor3 = Color3.fromRGB(0, 210, 255)
+StatusMainLabel.Font = Enum.Font.GothamBold
+StatusMainLabel.TextSize = 12
+StatusMainLabel.TextXAlignment = Enum.TextXAlignment.Left
+StatusMainLabel.Parent = StatusCard
 
--- Labels แสดงสถานะ
-local StatusMainLabel = StatusGroupBox:AddLabel("สถานะ: ปิดใช้งาน", true, "StatusMainLabel")
-local CargoLabel = StatusGroupBox:AddLabel("ของบนพ่วง: 0/8 | โหมด: รอรับของ", true, "CargoLabel")
-StatusGroupBox:AddDivider()
-local ProfitLabel = StatusGroupBox:AddLabel("รอบส่ง: 0 | กำไร: $0", true, "ProfitLabel")
-local CashTimeLabel = StatusGroupBox:AddLabel("เงิน: $0 | เวลา: 00:00:00", true, "CashTimeLabel")
+local CargoLabel = Instance.new("TextLabel")
+CargoLabel.Size = UDim2.new(1, -20, 0, 18)
+CargoLabel.Position = UDim2.fromOffset(10, 23)
+CargoLabel.BackgroundTransparency = 1
+CargoLabel.Text = "ของบนพ่วง: 0/8 | โหมด: รอรับของ"
+CargoLabel.TextColor3 = Color3.fromRGB(210, 215, 230)
+CargoLabel.Font = Enum.Font.GothamMedium
+CargoLabel.TextSize = 11
+CargoLabel.TextXAlignment = Enum.TextXAlignment.Left
+CargoLabel.Parent = StatusCard
 
--- ปุ่มทางลัดในหน้าแรก (กดใช้ได้ทันทีไม่ต้องสลับแท็บ)
-QuickUtilGroupBox:AddButton({
-	Text = "🚀 Boost FPS (Potato Mode V2)",
-	Tooltip = "ลดกราฟิกขั้นสุดและปลดล็อก FPS โดยไม่ทำให้เกมค้าง",
-	Func = function()
-		runExtremeFPSBooster()
-	end,
-})
+local ProfitLabel = Instance.new("TextLabel")
+ProfitLabel.Size = UDim2.new(1, -20, 0, 18)
+ProfitLabel.Position = UDim2.fromOffset(10, 41)
+ProfitLabel.BackgroundTransparency = 1
+ProfitLabel.Text = "รอบส่ง: 0 | กำไร: $0 | เวลา: 00:00:00"
+ProfitLabel.TextColor3 = Color3.fromRGB(120, 235, 160)
+ProfitLabel.Font = Enum.Font.GothamMedium
+ProfitLabel.TextSize = 11
+ProfitLabel.TextXAlignment = Enum.TextXAlignment.Left
+ProfitLabel.Parent = StatusCard
 
-QuickUtilGroupBox:AddButton({
-	Text = "🌐 ย้ายเซิร์ฟเวอร์คนน้อย (Low Server)",
-	Tooltip = "ค้นหาและย้ายไปเซิร์ฟเวอร์ที่คนน้อยที่สุดอัตโนมัติ",
-	Func = function()
-		hopLowPlayerServer()
-	end,
-})
+local Scroll = Instance.new("ScrollingFrame")
+Scroll.Size = UDim2.new(1, -24, 1, -120)
+Scroll.Position = UDim2.fromOffset(12, 114)
+Scroll.BackgroundTransparency = 1
+Scroll.ScrollBarThickness = 3
+Scroll.ScrollBarImageColor3 = Color3.fromRGB(80, 95, 130)
+Scroll.CanvasSize = UDim2.fromOffset(0, 0)
+Scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+Scroll.Parent = MainFrame
 
--- ------------------------------------------------------------------------------
--- แท็บ FPS & Server: ตั้งค่า FPS Booster V2 ละเอียด & Server Hop
--- ------------------------------------------------------------------------------
-local FPSGroupBox = Tabs.Utility:AddLeftGroupbox("Extreme FPS Booster V2")
-local ServerGroupBox = Tabs.Utility:AddRightGroupbox("ระบบเซิร์ฟเวอร์ (Server Hop)")
+local Layout = Instance.new("UIListLayout", Scroll)
+Layout.Padding = UDim.new(0, 6)
+Layout.SortOrder = Enum.SortOrder.LayoutOrder
 
-FPSGroupBox:AddButton({
-	Text = "🚀 เปิดใช้งาน Boost FPS ทันที",
-	Tooltip = "รันสคริปต์ลดกราฟิก Potato Mode V2 ตามการตั้งค่าด้านล่าง",
-	Func = function()
-		runExtremeFPSBooster()
-	end,
-})
+local function addToggle(title, defaultVal, callback)
+	local Row = Instance.new("Frame")
+	Row.Size = UDim2.new(1, -6, 0, 34)
+	Row.BackgroundColor3 = Color3.fromRGB(22, 25, 36)
+	Row.Parent = Scroll
+	Instance.new("UICorner", Row).CornerRadius = UDim.new(0, 6)
 
-FPSGroupBox:AddDivider()
+	local T = Instance.new("TextLabel")
+	T.Size = UDim2.new(1, -70, 1, 0)
+	T.Position = UDim2.fromOffset(12, 0)
+	T.BackgroundTransparency = 1
+	T.Text = title
+	T.TextColor3 = Color3.fromRGB(235, 240, 255)
+	T.Font = Enum.Font.GothamMedium
+	T.TextSize = 12
+	T.TextXAlignment = Enum.TextXAlignment.Left
+	T.Parent = Row
 
-FPSGroupBox:AddToggle("FPS_RemoveParticles", {
-	Text = "ปิดควัน ไฟ แสงสกิล (Particles/Trails)",
-	Default = FPS_CONFIG.RemoveParticles,
-	Callback = function(val) FPS_CONFIG.RemoveParticles = val end,
-})
+	local Sw = Instance.new("TextButton")
+	Sw.Size = UDim2.fromOffset(42, 20)
+	Sw.Position = UDim2.new(1, -52, 0.5, -10)
+	Sw.BackgroundColor3 = defaultVal and Color3.fromRGB(0, 190, 125) or Color3.fromRGB(50, 55, 75)
+	Sw.Text = ""
+	Sw.Parent = Row
+	Instance.new("UICorner", Sw).CornerRadius = UDim.new(1, 0)
 
-FPSGroupBox:AddToggle("FPS_RemoveDecals", {
-	Text = "ซ่อนรูปภาพแปะพื้นผิว (Decals/Textures)",
-	Default = FPS_CONFIG.RemoveDecals,
-	Callback = function(val) FPS_CONFIG.RemoveDecals = val end,
-})
+	local Knob = Instance.new("Frame")
+	Knob.Size = UDim2.fromOffset(14, 14)
+	Knob.Position = defaultVal and UDim2.fromOffset(25, 3) or UDim2.fromOffset(3, 3)
+	Knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	Knob.Parent = Sw
+	Instance.new("UICorner", Knob).CornerRadius = UDim.new(1, 0)
 
-FPSGroupBox:AddToggle("FPS_RemoveMeshTextures", {
-	Text = "ลบสีพื้นผิวโมเดล 3D และ PBR",
-	Default = FPS_CONFIG.RemoveMeshTextures,
-	Callback = function(val) FPS_CONFIG.RemoveMeshTextures = val end,
-})
+	local state = defaultVal
+	Sw.MouseButton1Click:Connect(function()
+		state = not state
+		TweenService:Create(Sw, TweenInfo.new(0.15), {
+			BackgroundColor3 = state and Color3.fromRGB(0, 190, 125) or Color3.fromRGB(50, 55, 75)
+		}):Play()
+		TweenService:Create(Knob, TweenInfo.new(0.15), {
+			Position = state and UDim2.fromOffset(25, 3) or UDim2.fromOffset(3, 3)
+		}):Play()
+		callback(state)
+	end)
+end
 
-FPSGroupBox:AddToggle("FPS_DisablePointLights", {
-	Text = "ปิดไฟหลอดเล็กๆ ตามแมพ (Lights)",
-	Default = FPS_CONFIG.DisablePointLights,
-	Callback = function(val) FPS_CONFIG.DisablePointLights = val end,
-})
+local function addButton(title, btnLabel, callback)
+	local Row = Instance.new("Frame")
+	Row.Size = UDim2.new(1, -6, 0, 34)
+	Row.BackgroundColor3 = Color3.fromRGB(22, 25, 36)
+	Row.Parent = Scroll
+	Instance.new("UICorner", Row).CornerRadius = UDim.new(0, 6)
 
-FPSGroupBox:AddToggle("FPS_RemoveClothes", {
-	Text = "ลบเสื้อผ้าตัวละครในเซิร์ฟ",
-	Default = FPS_CONFIG.RemoveClothes,
-	Callback = function(val) FPS_CONFIG.RemoveClothes = val end,
-})
+	local T = Instance.new("TextLabel")
+	T.Size = UDim2.new(1, -120, 1, 0)
+	T.Position = UDim2.fromOffset(12, 0)
+	T.BackgroundTransparency = 1
+	T.Text = title
+	T.TextColor3 = Color3.fromRGB(235, 240, 255)
+	T.Font = Enum.Font.GothamMedium
+	T.TextSize = 12
+	T.TextXAlignment = Enum.TextXAlignment.Left
+	T.Parent = Row
 
-FPSGroupBox:AddToggle("FPS_AutoOptimizeNewItems", {
-	Text = "ลดกราฟิกของที่เกิดใหม่ตลอดเวลา",
-	Default = FPS_CONFIG.AutoOptimizeNewItems,
-	Callback = function(val) FPS_CONFIG.AutoOptimizeNewItems = val end,
-})
+	local B = Instance.new("TextButton")
+	B.Size = UDim2.fromOffset(96, 22)
+	B.Position = UDim2.new(1, -106, 0.5, -11)
+	B.BackgroundColor3 = Color3.fromRGB(40, 95, 180)
+	B.Text = btnLabel
+	B.TextColor3 = Color3.fromRGB(255, 255, 255)
+	B.Font = Enum.Font.GothamBold
+	B.TextSize = 11
+	B.Parent = Row
+	Instance.new("UICorner", B).CornerRadius = UDim.new(0, 5)
 
-ServerGroupBox:AddButton({
-	Text = "🌐 ย้ายเซิร์ฟคนน้อย (Hop Low Server)",
-	Tooltip = "ค้นหาห้องที่ผู้เล่นน้อยที่สุดและย้ายเซิร์ฟเวอร์ทันที",
-	Func = function()
-		hopLowPlayerServer()
-	end,
-})
+	B.MouseButton1Click:Connect(function()
+		callback(B)
+	end)
+end
 
-ServerGroupBox:AddButton({
-	Text = "🔄 รีจอยเซิร์ฟเดิม (Rejoin Current)",
-	Tooltip = "กลับเข้าเซิร์ฟเวอร์เดิมอีกครั้ง",
-	Func = function()
-		TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
-	end,
-})
-
--- ------------------------------------------------------------------------------
--- แท็บ UI Settings: ตั้งค่าเมนู, ธีม และระบบเซฟ
--- ------------------------------------------------------------------------------
-local MenuGroup = Tabs["UI Settings"]:AddLeftGroupbox("Menu")
-
-MenuGroup:AddToggle("KeybindMenuOpen", {
-	Default = Library.KeybindFrame.Visible,
-	Text = "Open Keybind Menu",
-	Callback = function(value)
-		Library.KeybindFrame.Visible = value
-	end,
-})
-
-MenuGroup:AddToggle("ShowCustomCursor", {
-	Text = "Custom Cursor",
-	Default = false,
-	Callback = function(Value)
-		Library.ShowCustomCursor = Value
-	end,
-})
-
-MenuGroup:AddDropdown("NotificationSide", {
-	Values = { "Left", "Right" },
-	Default = "Right",
-	Text = "Notification Side",
-	Callback = function(Value)
-		Library:SetNotifySide(Value)
-	end,
-})
-
-MenuGroup:AddDropdown("DPIDropdown", {
-	Values = { "50%", "75%", "100%", "125%", "150%", "175%", "200%" },
-	Default = "100%",
-	Text = "DPI Scale",
-	Callback = function(Value)
-		Value = Value:gsub("%%", "")
-		local DPI = tonumber(Value)
-		Library:SetDPIScale(DPI)
-	end,
-})
-
-MenuGroup:AddDivider()
-MenuGroup:AddLabel("Menu bind")
-	:AddKeyPicker("MenuKeybind", { Default = "RightShift", NoUI = true, Text = "Menu keybind" })
-
-MenuGroup:AddButton("Unload", function()
-	Library:Unload()
-end)
-
-Library.ToggleKeybind = Options.MenuKeybind
-
-Library:OnUnload(function()
-	Env.AutoDelivery = false
-	if RUNTIME.fpsDescendantConn then
-		RUNTIME.fpsDescendantConn:Disconnect()
-		RUNTIME.fpsDescendantConn = nil
+addToggle("ออโต้ส่งของ", Env.AutoDelivery, function(val)
+	Env.AutoDelivery = val
+	if not val then
+		RUNTIME.statusText = "ปิดใช้งาน"
+		local v = getMyVehicle()
+		local t = TowablesController.GetAttachedTrailer()
+		setVehicleAnchored(v, t, false)
 	end
-	local v = getMyVehicle()
-	local t = TowablesController.GetAttachedTrailer()
-	setVehicleAnchored(v, t, false)
-	print("Tetekubb Hub Unloaded!")
 end)
 
-ThemeManager:SetLibrary(Library)
-SaveManager:SetLibrary(Library)
-SaveManager:IgnoreThemeSettings()
-SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
+addToggle("เสกรถและพ่วงอัตโนมัติ", CONFIG.AutoSpawnSetup, function(val)
+	CONFIG.AutoSpawnSetup = val
+end)
 
-ThemeManager:SetFolder("TetekubbHub")
-SaveManager:SetFolder("TetekubbHub/AutoDelivery")
-SaveManager:BuildConfigSection(Tabs["UI Settings"])
-ThemeManager:ApplyToTab(Tabs["UI Settings"])
-SaveManager:LoadAutoloadConfig()
+addToggle("ป้องกันด่าน AFK", CONFIG.AntiAFK, function(val)
+	CONFIG.AntiAFK = val
+end)
 
--- ==============================================================================
--- ลูปป้องกันด่าน AFK
--- ==============================================================================
+addButton("บังคับไปจุดส่งทันที", "ส่งทันที", function(btn)
+	RUNTIME.isDeliveringLatch = true
+	btn.Text = "สำเร็จ"
+	task.delay(0.8, function()
+		if btn and btn.Parent then btn.Text = "ส่งทันที" end
+	end)
+end)
+
+addButton("เสกรถและพ่วง", "เสกใหม่", function(btn)
+	btn.Text = "กำลังเสก"
+	task.spawn(function()
+		setupTruckAndTrailer()
+		if btn and btn.Parent then btn.Text = "เสกใหม่" end
+	end)
+end)
+
+addButton("รีเซ็ตอาชีพใหม่", "รีเซ็ต", function(btn)
+	btn.Text = "รอสักครู่"
+	task.spawn(function()
+		pcall(function() JobsController.RequestEndJobSession("jobPad") end)
+		RUNTIME.hasEnforcedHighRisk = false
+		RUNTIME.isDeliveringLatch = false
+		task.wait(0.8)
+		ensureDeliveryJobStarted()
+		if btn and btn.Parent then btn.Text = "รีเซ็ต" end
+	end)
+end)
+
+-- ================= ลูปป้องกันด่าน AFK =================
 LocalPlayer.Idled:Connect(function()
-	if CONFIG.AntiAFK and not Library.Unloaded then
+	if CONFIG.AntiAFK then
 		pcall(function()
 			VirtualUser:CaptureController()
 			VirtualUser:ClickButton2(Vector2.zero)
@@ -1088,7 +906,7 @@ end)
 
 task.spawn(function()
 	local lastInputSim = 0
-	while not Library.Unloaded and Env.AutoDeliverySession == CurrentSessionId do
+	while ScreenGui and ScreenGui.Parent and Env.AutoDeliverySession == CurrentSessionId do
 		if CONFIG.AntiAFK then
 			if game.PlaceId == AFK_PLACE_ID then
 				RUNTIME.statusText = "พบด่าน AFK กำลังกลับแมพหลัก"
@@ -1137,63 +955,43 @@ task.spawn(function()
 	end
 end)
 
--- ==============================================================================
--- ลูปอัปเดต UI (Obsidian Labels)
--- ==============================================================================
-local function safeSetLabel(labelObj, text)
-	if not labelObj then return end
-	pcall(function()
-		if type(labelObj.SetText) == "function" then
-			labelObj:SetText(text)
-		elseif labelObj.TextLabel then
-			labelObj.TextLabel.Text = text
-		end
-	end)
-end
-
+-- ================= ลูปอัปเดต UI =================
 task.spawn(function()
-	while not Library.Unloaded and Env.AutoDeliverySession == CurrentSessionId do
+	while ScreenGui and ScreenGui.Parent and Env.AutoDeliverySession == CurrentSessionId do
 		local curCash = getPlayerCash()
 		if not RUNTIME.startCash and curCash > 0 then
 			RUNTIME.startCash = curCash
 		end
 
-		safeSetLabel(StatusMainLabel, "สถานะ: " .. RUNTIME.statusText)
-		safeSetLabel(CargoLabel, string.format(
+		StatusMainLabel.Text = "สถานะ: " .. RUNTIME.statusText
+		CargoLabel.Text = string.format(
 			"ของบนพ่วง: %d/%d | โหมด: %s",
 			RUNTIME.carried,
 			RUNTIME.maxCap,
 			RUNTIME.isDeliveringLatch and "กำลังส่งของ" or "กำลังรับของ"
-		))
+		)
 
 		local profit = RUNTIME.startCash and math.max(0, curCash - RUNTIME.startCash) or 0
 		local elapsed = math.floor(os.clock() - RUNTIME.sessionStart)
 		local hours = math.floor(elapsed / 3600)
 		local mins = math.floor((elapsed % 3600) / 60)
 		local secs = elapsed % 60
-
-		safeSetLabel(ProfitLabel, string.format(
-			"รอบส่ง: %d | กำไร: $%s",
+		ProfitLabel.Text = string.format(
+			"รอบส่ง: %d | กำไร: $%s | เงิน: $%s | เวลา: %02d:%02d:%02d",
 			RUNTIME.deliveriesDone,
-			formatNumber(profit)
-		))
-		safeSetLabel(CashTimeLabel, string.format(
-			"เงิน: $%s | เวลา: %02d:%02d:%02d",
+			formatNumber(profit),
 			formatNumber(curCash),
 			hours,
 			mins,
 			secs
-		))
-
+		)
 		task.wait(0.25)
 	end
 end)
 
--- ==============================================================================
--- ลูปฟาร์มส่งของหลัก
--- ==============================================================================
+-- ================= ลูปฟาร์มส่งของหลัก =================
 task.spawn(function()
-	while not Library.Unloaded and Env.AutoDeliverySession == CurrentSessionId do
+	while ScreenGui and ScreenGui.Parent and Env.AutoDeliverySession == CurrentSessionId do
 		if not Env.AutoDelivery then
 			task.wait(0.3)
 			continue
@@ -1224,6 +1022,7 @@ task.spawn(function()
 						task.wait(0.25)
 					end
 					DeliveryJobTask.InteractWithDeliveryLocation(startPart)
+					-- รอให้ State งานถูกสร้างขึ้นมาก่อน เพื่อไม่ให้วาร์ปซ้ำ
 					local waitStart = os.clock() + 2.5
 					while Env.AutoDelivery and os.clock() < waitStart do
 						if DeliveryJobTask.GetCurrentDeliveryState() ~= nil then
@@ -1254,7 +1053,7 @@ task.spawn(function()
 				RUNTIME.isDeliveringLatch = true
 			end
 
-			-- ================= 1. โหมดไปจุดส่งของ =================
+			-- ================= 1. โหมดไปจุดส่งของ (เข้าเมื่อมี DestinationPosition เท่านั้น) =================
 			if RUNTIME.isDeliveringLatch and state.DestinationPosition ~= nil then
 				local destPos = state.DestinationPosition
 				RUNTIME.statusText = string.format("ไปจุดส่งของ (%d/%d)", carried, maxCap)
@@ -1262,6 +1061,7 @@ task.spawn(function()
 				local dropoffPart = getDeliveryLocationPart(destPos, CONFIG.ExactPadRadius)
 				local curVeh = getMyVehicle()
 
+				-- วาร์ปเฉพาะเมื่อรถยังไม่ได้อยู่ในวงกลมจุดส่งเท่านั้น!
 				if not curVeh or flatDistanceXZ(curVeh:GetPivot().Position, destPos) > CONFIG.InZoneRadiusXZ then
 					local targetCF = isValidPart(dropoffPart) and dropoffPart.CFrame or CFrame.new(destPos)
 					local streamedDrop = teleportTruckAndTrailer(targetCF, destPos, false)
@@ -1281,7 +1081,7 @@ task.spawn(function()
 				local dropTimeout = os.clock() + 28
 				local flipDropYaw = false
 
-				while Env.AutoDelivery and not Library.Unloaded and Env.AutoDeliverySession == CurrentSessionId and os.clock() < dropTimeout do
+				while Env.AutoDelivery and Env.AutoDeliverySession == CurrentSessionId and os.clock() < dropTimeout do
 					dampSlidingIfNeeded()
 
 					local current = DeliveryJobTask.GetCurrentDeliveryState()
@@ -1292,6 +1092,7 @@ task.spawn(function()
 						RUNTIME.deliveriesDone += 1
 						RUNTIME.statusText = "ส่งของสำเร็จ"
 						RUNTIME.isDeliveringLatch = false
+						-- รอ 0.25 วินาทีให้เซิร์ฟเวอร์อัปเดตจุดรับรอบถัดไปให้เสร็จก่อน
 						task.wait(0.25)
 						break
 					end
@@ -1312,11 +1113,13 @@ task.spawn(function()
 					if isValidPart(dropoffPart) and curVeh then
 						ensurePlayerSeated(curVeh)
 
+						-- ถ้ารถไหลหลุดออกจากวงเกิน 18 Studs ให้ดึงกลับเข้าวง
 						if flatDistanceXZ(curVeh:GetPivot().Position, dropoffPart.Position) > CONFIG.InZoneRadiusXZ then
 							teleportTruckAndTrailer(dropoffPart.CFrame, curDestPos, flipDropYaw)
 							task.wait(0.2)
 							lastInteractTime = os.clock()
 							DeliveryJobTask.InteractWithDeliveryLocation(dropoffPart)
+						-- ถ้าของไม่ลดเลยเกิน 5 วินาทีเต็ม ค่อยกลับหัวรถ 180 องศาเพื่อเปลี่ยนมุมบนเนิน
 						elseif (os.clock() - lastProgressTime) >= CONFIG.StallRetryTime then
 							lastProgressTime = os.clock()
 							flipDropYaw = not flipDropYaw
@@ -1325,6 +1128,7 @@ task.spawn(function()
 							task.wait(0.25)
 							lastInteractTime = os.clock()
 							DeliveryJobTask.InteractWithDeliveryLocation(dropoffPart)
+						-- ห้ามกดซ้ำเด็ดขาดถ้าหลอดกำลังหมุนอยู่ (current.IsDropping == true)
 						elseif not current.IsDropping and (os.clock() - lastInteractTime) >= 1.6 then
 							lastInteractTime = os.clock()
 							DeliveryJobTask.InteractWithDeliveryLocation(dropoffPart)
@@ -1339,7 +1143,7 @@ task.spawn(function()
 					task.wait(0.15)
 				end
 
-			-- ================= 2. โหมดไปจุดรับของ =================
+			-- ================= 2. โหมดไปจุดรับของ (และรอจนกว่าพิกัดจุดส่งจะมาครบ) =================
 			elseif state.PickupPosition ~= nil then
 				local pickupPos = state.PickupPosition
 				RUNTIME.statusText = string.format("ไปจุดรับของ (%d/%d)", carried, maxCap)
@@ -1347,6 +1151,7 @@ task.spawn(function()
 				local pickupPart = getDeliveryLocationPart(pickupPos, CONFIG.ExactPadRadius)
 				local curVeh = getMyVehicle()
 
+				-- สำคัญที่สุด: ถ้ารถจอดอยู่ในวงรับของอยู่แล้ว ห้ามสั่งวาร์ปซ้ำเด็ดขาด!
 				if not curVeh or flatDistanceXZ(curVeh:GetPivot().Position, pickupPos) > CONFIG.InZoneRadiusXZ then
 					local targetCF = isValidPart(pickupPart) and pickupPart.CFrame or CFrame.new(pickupPos)
 					local streamedPick = teleportTruckAndTrailer(targetCF, pickupPos, false)
@@ -1367,7 +1172,7 @@ task.spawn(function()
 				local preStreamedDest = false
 				local flipPickupYaw = false
 
-				while Env.AutoDelivery and not Library.Unloaded and Env.AutoDeliverySession == CurrentSessionId and os.clock() < collectTimeout do
+				while Env.AutoDelivery and Env.AutoDeliverySession == CurrentSessionId and os.clock() < collectTimeout do
 					dampSlidingIfNeeded()
 
 					local current = DeliveryJobTask.GetCurrentDeliveryState()
@@ -1394,9 +1199,10 @@ task.spawn(function()
 					local pickupDepleted = (curRem ~= nil and curRem <= 0 and curCarried > 0)
 					local noPickupPos = (curCarried > 0 and current.PickupPosition == nil)
 
+					-- ต้องทั้งของครบ (fullNow / pickupDepleted / noPickupPos) และเซิร์ฟเวอร์ส่ง DestinationPosition มาแล้วเท่านั้น ถึงจะออกจากจุดรับ!
 					if (fullNow or pickupDepleted or noPickupPos) and current.DestinationPosition ~= nil then
 						RUNTIME.isDeliveringLatch = true
-						task.wait(0.2)
+						task.wait(0.2) -- รอให้เซิร์ฟเวอร์ปิดสถานะจุดรับให้สมบูรณ์ก่อนวาร์ปออก
 						break
 					end
 
@@ -1410,11 +1216,13 @@ task.spawn(function()
 					if isValidPart(pickupPart) and curVeh then
 						ensurePlayerSeated(curVeh)
 
+						-- ถ้ารถไหลออกจากวงเกิน 18 Studs ค่อยดึงกลับเข้าวง
 						if flatDistanceXZ(curVeh:GetPivot().Position, pickupPart.Position) > CONFIG.InZoneRadiusXZ then
 							teleportTruckAndTrailer(pickupPart.CFrame, curPickPos, flipPickupYaw)
 							task.wait(0.2)
 							lastInteractTime = os.clock()
 							DeliveryJobTask.InteractWithDeliveryLocation(pickupPart)
+						-- ถ้าของไม่เพิ่มเกิน 5 วินาทีเต็ม ค่อยปรับมุมรถใหม่
 						elseif (os.clock() - lastIncreaseTime) >= CONFIG.StallRetryTime then
 							lastIncreaseTime = os.clock()
 							flipPickupYaw = not flipPickupYaw
@@ -1423,6 +1231,7 @@ task.spawn(function()
 							task.wait(0.25)
 							lastInteractTime = os.clock()
 							DeliveryJobTask.InteractWithDeliveryLocation(pickupPart)
+						-- ห้ามกดซ้ำถ้าหลอดรับของกำลังหมุนอยู่ (current.IsCollecting == true)
 						elseif not current.IsCollecting and (os.clock() - lastInteractTime) >= 1.6 then
 							lastInteractTime = os.clock()
 							DeliveryJobTask.InteractWithDeliveryLocation(pickupPart)
