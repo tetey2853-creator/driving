@@ -18,8 +18,6 @@ local function safeRequire(mod)
 end
 
 local Remotes = require(ReplicatedStorage.Modules.Shared.Remotes)
-local DataModule = safeRequire(ReplicatedStorage.Modules.Shared:FindFirstChild("Data"))
-local MathModule = safeRequire(ReplicatedStorage.Modules.Shared:FindFirstChild("Math"))
 local GameConstants = safeRequire(ReplicatedStorage.Modules.Shared:FindFirstChild("Game") and ReplicatedStorage.Modules.Shared.Game:FindFirstChild("GameConstants"))
 local JobsController = require(ReplicatedStorage.Modules.Client.Jobs.JobsController)
 local JobsUtil = require(ReplicatedStorage.Modules.Shared.Jobs.JobsUtil)
@@ -36,7 +34,7 @@ local CurrentSessionId = os.clock()
 Env.AutoDeliverySession = CurrentSessionId
 Env.AutoDelivery = false
 
--- ล้าง Connection เก่าทั้งหมดหากมีการรันสคริปต์ซ้ำเพื่อป้องกันแรมรั่วสะสม
+-- ล้าง Connection เก่าทั้งหมดหากมีการรันสคริปต์ซ้ำ
 if type(Env.DE_Connections) == "table" then
 	for _, conn in ipairs(Env.DE_Connections) do
 		pcall(function() conn:Disconnect() end)
@@ -52,6 +50,7 @@ end
 local HIGH_RISK_MODE = (DeliveryConstants.DeliveryModes and (DeliveryConstants.DeliveryModes.HighRisk or DeliveryConstants.DeliveryModes.Risky)) or "HighRisk"
 local MAIN_PLACE_ID = 3351674303
 local AFK_PLACE_ID = (GameConstants and GameConstants.PlaceIds and GameConstants.PlaceIds.AFK) or 99421106727783
+local DELIVERY_TAG = DeliveryConstants.Tags.DeliveryLocation
 
 local CONFIG = {
 	TruckId = "Ford-LTL9000-1989",
@@ -59,8 +58,8 @@ local CONFIG = {
 	DeliveryMode = HIGH_RISK_MODE,
 	ExactPadRadius = 55,
 	FallbackPadRadius = 165,
-	InZoneRadiusXZ = 20, -- ระยะปลอดภัยในจุดรับ-ส่ง ห้ามวาร์ปซ้ำเด็ดขาด
-	StallRetryTime = 8.0, -- รอเฉพาะกรณีที่หลอดเหลืองไม่ขึ้นและของไม่ขยับเกิน 8 วินาทีจริงๆ เท่านั้น
+	InZoneRadiusXZ = 20,
+	StallRetryTime = 8.0,
 	AutoSpawnSetup = true,
 	AntiAFK = true,
 }
@@ -68,28 +67,37 @@ local CONFIG = {
 local RUNTIME = {
 	isDeliveringLatch = false,
 	hasEnforcedHighRisk = false,
-	statusText = "ปิดใช้งาน",
-	carried = 0,
-	maxCap = 8,
-	deliveriesDone = 0,
-	startCash = nil,
-	lastKnownCash = nil,
-	sessionStart = os.clock(),
 	trailerRelativeCF = CFrame.new(0, 0, 23),
 }
 
--- ================= ระบบ Cache เบาเครื่อง (คุมเฉพาะ RootPart 2 ชิ้น) =================
+-- ================= ระบบ Cache ลดการสร้างขยะในแรม (Zero-Allocation) =================
 local CACHE = {
 	vehicle = nil,
 	vehicleRoot = nil,
 	vehicleSeat = nil,
 	trailer = nil,
 	trailerRoot = nil,
-	hudCashLabel = nil,
-	lastHudScan = 0,
 	lastStreamPos = nil,
 	lastStreamTime = 0,
+	locations = CollectionService:GetTagged(DELIVERY_TAG),
+	locationsDirty = false,
 }
+
+trackConnection(CollectionService:GetInstanceAddedSignal(DELIVERY_TAG):Connect(function()
+	CACHE.locationsDirty = true
+end))
+
+trackConnection(CollectionService:GetInstanceRemovedSignal(DELIVERY_TAG):Connect(function()
+	CACHE.locationsDirty = true
+end))
+
+local function getTaggedLocations()
+	if CACHE.locationsDirty then
+		CACHE.locations = CollectionService:GetTagged(DELIVERY_TAG)
+		CACHE.locationsDirty = false
+	end
+	return CACHE.locations
+end
 
 local SharedRaycastParams = RaycastParams.new()
 SharedRaycastParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -138,7 +146,6 @@ local function flatDistanceXZ(posA, posB)
 	return math.sqrt(dx * dx + dz * dz)
 end
 
--- โหลดแมพแบบพื้นหลังโดยไม่ขยับรถไปลอยค้างให้กล้องสั่น
 local function safeRequestStream(pos, timeoutWait)
 	if not pos then return end
 	local now = os.clock()
@@ -161,7 +168,7 @@ local function safeRequestStream(pos, timeoutWait)
 	end
 end
 
--- ================= ระบบบล็อกการย้ายไปด่าน AFK ของเกม =================
+-- ================= ระบบบล็อกการย้ายไปด่าน AFK =================
 local function isAFKTeleportCall(remoteName, ...)
 	local nameLower = tostring(remoteName):lower()
 	if nameLower:find("afk") then
@@ -231,204 +238,7 @@ pcall(function()
 	end
 end)
 
--- ================= ระบบ Multi-Source Smart Cash Sync =================
-local function formatNumber(n)
-	local str = tostring(math.floor(n or 0))
-	return str:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", "")
-end
-
--- อ่านค่าเงินจากป้าย HUD บนหน้าจอของผู้เล่นโดยตรง (รองรับทั้งแบบเต็ม $1,234,567 และแบบย่อ)
-local function parseHudCashText(text)
-	if type(text) ~= "string" then return nil, false end
-	local clean = text:gsub("%s+", "")
-	-- รูปแบบตัวเลขเต็ม เช่น $1,234,567 หรือ $500
-	local fullMatch = clean:match("^%$([%d,]+)$")
-	if fullMatch then
-		local digits = fullMatch:gsub(",", "")
-		local num = tonumber(digits)
-		if num and num >= 0 then
-			return math.floor(num), true -- true = ค่าตรงทุกหลัก 100%
-		end
-	end
-	-- รูปแบบตัวย่อ เช่น $1.25M, $450K, $2.1B (ใช้เทียบความใกล้เคียง)
-	local numPart, suffix = clean:match("^%$([%d%.]+)([KMBTkmbt])$")
-	if numPart and suffix then
-		local base = tonumber(numPart)
-		local mults = { K = 1e3, M = 1e6, B = 1e9, T = 1e12 }
-		local mult = mults[suffix:upper()]
-		if base and mult then
-			return math.floor(base * mult), false
-		end
-	end
-	return nil, false
-end
-
-local function getHudCashValue()
-	if CACHE.hudCashLabel and CACHE.hudCashLabel.Parent and CACHE.hudCashLabel.Visible then
-		local val, isExact = parseHudCashText(CACHE.hudCashLabel.Text)
-		if val ~= nil then
-			return val, isExact
-		end
-	end
-
-	local now = os.clock()
-	if (now - CACHE.lastHudScan) < 1.5 then
-		return nil, false
-	end
-	CACHE.lastHudScan = now
-
-	local bestVal, bestExact = nil, false
-	for _, gui in ipairs(PlayerGui:GetChildren()) do
-		if gui:IsA("ScreenGui") and gui.Name ~= "DE_AutoDelivery_UI" and gui.Enabled then
-			for _, desc in ipairs(gui:GetDescendants()) do
-				if desc:IsA("TextLabel") and desc.Visible then
-					local val, isExact = parseHudCashText(desc.Text)
-					if val ~= nil then
-						if isExact then
-							CACHE.hudCashLabel = desc
-							return val, true
-						elseif not bestVal then
-							bestVal = val
-							bestExact = false
-							CACHE.hudCashLabel = desc
-						end
-					end
-				end
-			end
-		end
-	end
-	return bestVal, bestExact
-end
-
--- แปลงค่าตัวเลขดิบเป็นรายการค่าที่เป็นไปได้ (ทั้งค่าตรงและค่าที่ถอดรหัสผ่าน MathModule)
-local function addCashCandidates(rawVal, list)
-	local num = tonumber(rawVal)
-	if not num then return end
-
-	if MathModule and type(MathModule.decodeLargeNumber) == "function" then
-		local ok, decoded = pcall(MathModule.decodeLargeNumber, num)
-		if ok and type(decoded) == "number" and decoded == decoded and decoded >= 0 and decoded < 1e15 then
-			table.insert(list, math.floor(decoded))
-		end
-	end
-
-	if num >= 0 and num < 1e15 and num == num then
-		table.insert(list, math.floor(num))
-	end
-end
-
-local function getPlayerCash()
-	-- 1. เช็กจากป้ายเงินสดบนหน้าจอเกมจริง (PlayerGui HUD)
-	local hudVal, isHudExact = getHudCashValue()
-	if isHudExact and hudVal ~= nil then
-		RUNTIME.lastKnownCash = hudVal
-		return hudVal
-	end
-
-	local candidates = {}
-
-	-- 2. ดึงจาก DataModule โดยตรง (ไม่ล็อกติดกับ Object เก่าตัวเดียว)
-	if DataModule then
-		pcall(function()
-			if type(DataModule.Get) == "function" then
-				addCashCandidates(DataModule:Get("Cash") or DataModule.Get(LocalPlayer, "Cash"), candidates)
-			end
-			if type(DataModule.GetStat) == "function" then
-				addCashCandidates(DataModule.GetStat(LocalPlayer, "Cash"), candidates)
-			end
-			local statsFolder = nil
-			if type(DataModule.GetStatsFolder) == "function" then
-				statsFolder = DataModule.GetStatsFolder(LocalPlayer)
-			elseif type(DataModule.GetLoadedStatsFolder) == "function" then
-				statsFolder = DataModule.GetLoadedStatsFolder(LocalPlayer)
-			end
-			if statsFolder and statsFolder:FindFirstChild("Cash") then
-				addCashCandidates(statsFolder.Cash.Value, candidates)
-			end
-		end)
-	end
-
-	-- 3. ดึงจากทุกโฟลเดอร์ Stats / leaderstats / ReplicatedStorage.Stats
-	for _, folderName in ipairs({ "Stats", "leaderstats" }) do
-		local f = LocalPlayer:FindFirstChild(folderName)
-		if f and f:FindFirstChild("Cash") then
-			addCashCandidates(f.Cash.Value, candidates)
-		end
-	end
-
-	local repStats = ReplicatedStorage:FindFirstChild("Stats")
-	if repStats then
-		local f = repStats:FindFirstChild(LocalPlayer.Name) or repStats:FindFirstChild(tostring(LocalPlayer.UserId))
-		if f and f:FindFirstChild("Cash") then
-			addCashCandidates(f.Cash.Value, candidates)
-		end
-	end
-
-	-- 4. ดึงจาก Attribute ของผู้เล่น
-	addCashCandidates(LocalPlayer:GetAttribute("Cash"), candidates)
-
-	if #candidates == 0 then
-		return hudVal or RUNTIME.lastKnownCash or 0
-	end
-
-	-- คัดกรองค่าที่ตรงกับความจริงมากที่สุด
-	-- กรณีมีป้าย HUD แบบย่อ (เช่น $1.25M) ให้เลือกค่าที่ใกล้เคียงกับป้าย HUD ที่สุด
-	if hudVal and hudVal > 0 then
-		local closest = candidates[1]
-		local minDiff = math.abs(closest - hudVal)
-		for i = 2, #candidates do
-			local c = candidates[i]
-			local diff = math.abs(c - hudVal)
-			if diff < minDiff then
-				minDiff = diff
-				closest = c
-			end
-		end
-		RUNTIME.lastKnownCash = closest
-		return closest
-	end
-
-	-- กรณีเทียบกับเงินก่อนหน้าหลังส่งของเสร็จ (เลือกค่าที่เปลี่ยนแปลงอย่างสมเหตุสมผลและมีการอัปเดตจริง)
-	if RUNTIME.lastKnownCash and RUNTIME.lastKnownCash > 0 then
-		local bestUpdated = nil
-		local bestDelta = math.huge
-		for _, c in ipairs(candidates) do
-			local delta = c - RUNTIME.lastKnownCash
-			-- รายได้ต่อรอบในการส่งของอยู่ในช่วงที่สมเหตุสมผล (เช่น +$1 ถึง +$10,000,000)
-			if delta > 0 and delta < 1e7 and delta < bestDelta then
-				bestDelta = delta
-				bestUpdated = c
-			end
-		end
-		if bestUpdated then
-			RUNTIME.lastKnownCash = bestUpdated
-			return bestUpdated
-		end
-
-		-- ถ้ายังไม่มีค่าที่เพิ่มขึ้น ให้เลือกค่าที่ใกล้เคียงกับเงินเดิมที่สุด (ป้องกันค่าเข้ารหัสกระโดดเป็นพันล้าน)
-		local closestToLast = candidates[1]
-		local smallestGap = math.abs(closestToLast - RUNTIME.lastKnownCash)
-		for i = 2, #candidates do
-			local gap = math.abs(candidates[i] - RUNTIME.lastKnownCash)
-			if gap < smallestGap then
-				smallestGap = gap
-				closestToLast = candidates[i]
-			end
-		end
-		RUNTIME.lastKnownCash = closestToLast
-		return closestToLast
-	end
-
-	RUNTIME.lastKnownCash = candidates[1]
-	return candidates[1]
-end
-
-local initialCash = getPlayerCash()
-if initialCash > 0 then
-	RUNTIME.startCash = initialCash
-end
-
--- ================= ระบบควบคุมรถและฟิสิกส์แบบ Zero-Lag =================
+-- ================= ระบบควบคุมรถและฟิสิกส์แบบเบาเครื่อง =================
 local VehiclesFolder = Workspace:FindFirstChild("Vehicles")
 
 local function getMyVehicle()
@@ -454,7 +264,6 @@ local function isTrailerAttached(vehicle)
 	return hitch and hitch:GetAttribute("IsAttached") == true
 end
 
--- ล้างความเร็วเฉพาะที่ AssemblyRootPart เพียงชิ้นเดียว (ไม่วนลูป 150 ชิ้น)
 local function zeroVelocity(model)
 	if not model or not model.Parent then return end
 	local root = getRootPart(model)
@@ -474,7 +283,6 @@ local function setVehicleAnchored(vehicle, trailer, anchored)
 	end
 end
 
--- กระตุ้นฟิสิกส์เบาๆ หลังวาร์ป เพื่อให้ Server รับรู้ตำแหน่งรถทันที
 local function wakeVehiclePhysics(vehicle, trailer)
 	if not vehicle or not vehicle.Parent then return end
 	refreshVehicleCache(vehicle, trailer)
@@ -504,7 +312,6 @@ local function wakeVehiclePhysics(vehicle, trailer)
 	end
 end
 
--- ประคองรถไม่ให้ไหลตกเนินโดยเช็กและคุมเฉพาะ RootPart 2 ชิ้น (ลื่น 100%)
 local function dampSlidingIfNeeded()
 	local vehicle = CACHE.vehicle or getMyVehicle()
 	if not vehicle or not vehicle.Parent then return end
@@ -552,23 +359,15 @@ local function ensurePlayerSeated(vehicle)
 	return hum.SeatPart == seat
 end
 
--- คำนวณ CFrame ให้กึ่งกลางระหว่างหัวลากกับพ่วงทับจุดรับ-ส่งพอดี และขนานกับความลาดชันของพื้น
-local function getSlopeAlignedGroundCFrame(targetCF, ignoreList, flipYaw)
+local function getSlopeAlignedGroundCFrame(targetCF, char, vehicle, trailer, flipYaw)
 	local pos = targetCF.Position
 	local _, yaw, _ = targetCF:ToEulerAnglesYXZ()
 	if flipYaw then
 		yaw = yaw + math.pi
 	end
 
-	local exclusions = {}
-	if ignoreList then
-		for i = 1, #ignoreList do
-			if ignoreList[i] then
-				exclusions[#exclusions + 1] = ignoreList[i]
-			end
-		end
-	end
-	local taggedPads = CollectionService:GetTagged(DeliveryConstants.Tags.DeliveryLocation)
+	local exclusions = { char, vehicle, trailer }
+	local taggedPads = getTaggedLocations()
 	for i = 1, #taggedPads do
 		exclusions[#exclusions + 1] = taggedPads[i]
 	end
@@ -595,12 +394,11 @@ local function getSlopeAlignedGroundCFrame(targetCF, ignoreList, flipYaw)
 	pitch = math.clamp(pitch, math.rad(-20), math.rad(20))
 
 	local baseHeight = math.max(centerY, (frontY + backY) * 0.5) + 2.3
-	-- เลื่อนหัวลากไปข้างหน้า 6 Studs เพื่อให้จุดเชื่อมต่อระหว่างรถกับพ่วงอยู่กลางวงรับ-ส่งพอดี
 	return CFrame.new(pos.X, baseHeight, pos.Z) * CFrame.Angles(0, yaw, 0) * CFrame.Angles(pitch, 0, 0) * CFrame.new(0, 0, -6)
 end
 
 local function getDeliveryLocationPart(targetPos, customRadius)
-	local locations = CollectionService:GetTagged(DeliveryConstants.Tags.DeliveryLocation)
+	local locations = getTaggedLocations()
 
 	if targetPos then
 		local closestPart = nil
@@ -663,13 +461,11 @@ local function pivotTruckAndTrailerAligned(vehicle, trailer, cabCF)
 	wakeVehiclePhysics(vehicle, trailer)
 end
 
--- วาร์ปแบบไร้แรงกระตุก: โหลดแมพปลายทางให้เสร็จก่อน แล้วค่อยวางรถลงพื้นครั้งเดียวจบ
 local function teleportTruckAndTrailer(targetCFrame, waitForStreamPos, flipYaw)
 	local vehicle = getMyVehicle()
 	local trailer = TowablesController.GetAttachedTrailer()
 	local char = LocalPlayer.Character
 	local destPos = waitForStreamPos or targetCFrame.Position
-	local ignore = { char, vehicle, trailer }
 
 	refreshVehicleCache(vehicle, trailer)
 
@@ -677,15 +473,13 @@ local function teleportTruckAndTrailer(targetCFrame, waitForStreamPos, flipYaw)
 		ensurePlayerSeated(vehicle)
 	end
 
-	-- ถ้าจุดรับ-ส่งโหลดพร้อมอยู่แล้ว ให้วางรถลงพื้นทันทีในครั้งเดียว
 	local readyPart = getDeliveryLocationPart(destPos, CONFIG.ExactPadRadius)
 	if isValidPart(readyPart) and vehicle then
-		local cleanCabCF = getSlopeAlignedGroundCFrame(readyPart.CFrame, ignore, flipYaw)
+		local cleanCabCF = getSlopeAlignedGroundCFrame(readyPart.CFrame, char, vehicle, trailer, flipYaw)
 		pivotTruckAndTrailerAligned(vehicle, trailer, cleanCabCF)
 		return readyPart
 	end
 
-	-- ถ้าระยะไกลและแมพยังไม่โหลด ให้โหลดแมพในพื้นหลังขณะที่รถยังจอดนิ่งอยู่ที่เดิม (กล้องไม่สั่น)
 	safeRequestStream(destPos, 1.8)
 
 	local waitDeadline = os.clock() + 1.5
@@ -697,7 +491,6 @@ local function teleportTruckAndTrailer(targetCFrame, waitForStreamPos, flipYaw)
 
 	streamedPart = streamedPart or getDeliveryLocationPart(destPos, CONFIG.FallbackPadRadius)
 
-	-- กรณีเซิร์ฟเวอร์ต้องเห็นตัวผู้เล่นใกล้จุดหมายถึงจะยอมสร้าง Pad ให้ย้ายไป Anchor นิ่งๆ ครั้งเดียว (ไม่วนลูป PivotTo)
 	if not isValidPart(streamedPart) and vehicle and vehicle.Parent then
 		local tempCF = CFrame.new(destPos + Vector3.new(0, 12, 0))
 		vehicle:PivotTo(tempCF)
@@ -719,7 +512,7 @@ local function teleportTruckAndTrailer(targetCFrame, waitForStreamPos, flipYaw)
 
 	if vehicle and vehicle.Parent then
 		local finalTargetCF = isValidPart(streamedPart) and streamedPart.CFrame or CFrame.new(destPos)
-		local cleanCabCF = getSlopeAlignedGroundCFrame(finalTargetCF, ignore, flipYaw)
+		local cleanCabCF = getSlopeAlignedGroundCFrame(finalTargetCF, char, vehicle, trailer, flipYaw)
 		pivotTruckAndTrailerAligned(vehicle, trailer, cleanCabCF)
 		return streamedPart
 	elseif char then
@@ -733,7 +526,6 @@ local function setupTruckAndTrailer()
 	local vehicle = getMyVehicle()
 
 	if not vehicle or not vehicle.Parent or vehicle:GetAttribute("VehicleId") ~= CONFIG.TruckId then
-		RUNTIME.statusText = "เสกรถบรรทุก"
 		local args = {
 			[1] = "Spawn",
 			[2] = CONFIG.TruckId,
@@ -758,7 +550,6 @@ local function setupTruckAndTrailer()
 	end
 
 	if vehicle and not isTrailerAttached(vehicle) then
-		RUNTIME.statusText = "เสกพ่วงหลัง"
 		pcall(function()
 			TowablesController.AttemptToSpawnTowable(CONFIG.TrailerId)
 		end)
@@ -799,20 +590,16 @@ local function getDeliveryMetrics(state)
 		or (DeliveryUtil.GetPackagesRemainingAtPickup and DeliveryUtil.GetPackagesRemainingAtPickup(LocalPlayer))
 		or LocalPlayer:GetAttribute("PackagesRemainingAtPickup")
 
-	RUNTIME.carried = tonumber(carried) or 0
-	RUNTIME.maxCap = tonumber(maxCap) or 8
-
-	return RUNTIME.carried, RUNTIME.maxCap, remAtPickup ~= nil and tonumber(remAtPickup) or nil
+	return tonumber(carried) or 0, tonumber(maxCap) or 8, remAtPickup ~= nil and tonumber(remAtPickup) or nil
 end
 
 local function ensureDeliveryJobStarted()
 	local state = DeliveryJobTask.GetCurrentDeliveryState()
 	local carried = getDeliveryMetrics(state)
 
-	local needInitialHighRisk = (not RUNTIME.hasEnforcedHighRisk and JobsUtil.DoesPlayerHaveJob(LocalPlayer, JobsConstants.JobIds.Delivery) and carried == 0 and RUNTIME.deliveriesDone == 0)
+	local needInitialHighRisk = (not RUNTIME.hasEnforcedHighRisk and JobsUtil.DoesPlayerHaveJob(LocalPlayer, JobsConstants.JobIds.Delivery) and carried == 0)
 
 	if needInitialHighRisk then
-		RUNTIME.statusText = "ตั้งค่าโหมด HighRisk เริ่มต้น"
 		pcall(function()
 			JobsController.RequestEndJobSession("jobPad")
 		end)
@@ -821,7 +608,6 @@ local function ensureDeliveryJobStarted()
 	end
 
 	if not JobsUtil.DoesPlayerHaveJob(LocalPlayer, JobsConstants.JobIds.Delivery) then
-		RUNTIME.statusText = "เริ่มงานส่งของ"
 		pcall(function()
 			Remotes.fireServer(
 				JobsConstants.Remotes.RequestStartJobSession,
@@ -844,7 +630,7 @@ local function ensureDeliveryJobStarted()
 	end
 end
 
--- ================= UI =================
+-- ================= UI คลีน (เฉพาะปุ่มควบคุม ไม่มีลูปอัปเดตข้อความ) =================
 local OldGui = PlayerGui:FindFirstChild("DE_AutoDelivery_UI")
 if OldGui then
 	OldGui:Destroy()
@@ -859,8 +645,8 @@ ScreenGui.DisplayOrder = 999
 ScreenGui.Parent = PlayerGui
 
 local FloatBtn = Instance.new("TextButton")
-FloatBtn.Size = UDim2.fromOffset(42, 42)
-FloatBtn.Position = UDim2.new(0, 18, 0.5, -21)
+FloatBtn.Size = UDim2.fromOffset(40, 40)
+FloatBtn.Position = UDim2.new(0, 18, 0.5, -20)
 FloatBtn.BackgroundColor3 = Color3.fromRGB(20, 22, 30)
 FloatBtn.Text = "UI"
 FloatBtn.TextSize = 13
@@ -873,8 +659,8 @@ FloatStroke.Color = Color3.fromRGB(55, 65, 90)
 FloatStroke.Thickness = 1.5
 
 local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.fromOffset(400, 330)
-MainFrame.Position = UDim2.new(0.5, -200, 0.5, -165)
+MainFrame.Size = UDim2.fromOffset(310, 266)
+MainFrame.Position = UDim2.new(0.5, -155, 0.5, -133)
 MainFrame.BackgroundColor3 = Color3.fromRGB(15, 17, 24)
 MainFrame.BorderSizePixel = 0
 MainFrame.Parent = ScreenGui
@@ -919,7 +705,7 @@ end
 makeDraggable(FloatBtn, FloatBtn)
 
 local TopBar = Instance.new("Frame")
-TopBar.Size = UDim2.new(1, 0, 0, 36)
+TopBar.Size = UDim2.new(1, 0, 0, 34)
 TopBar.BackgroundColor3 = Color3.fromRGB(22, 25, 36)
 TopBar.BorderSizePixel = 0
 TopBar.Parent = MainFrame
@@ -927,10 +713,10 @@ Instance.new("UICorner", TopBar).CornerRadius = UDim.new(0, 10)
 makeDraggable(TopBar, MainFrame)
 
 local TitleLabel = Instance.new("TextLabel")
-TitleLabel.Size = UDim2.new(1, -80, 1, 0)
-TitleLabel.Position = UDim2.fromOffset(14, 0)
+TitleLabel.Size = UDim2.new(1, -60, 1, 0)
+TitleLabel.Position = UDim2.fromOffset(12, 0)
 TitleLabel.BackgroundTransparency = 1
-TitleLabel.Text = "Auto Delivery (Ultra Smooth & Smart Cash)"
+TitleLabel.Text = "Auto Delivery"
 TitleLabel.TextColor3 = Color3.fromRGB(240, 245, 255)
 TitleLabel.Font = Enum.Font.GothamBold
 TitleLabel.TextSize = 13
@@ -939,7 +725,7 @@ TitleLabel.Parent = TopBar
 
 local MinBtn = Instance.new("TextButton")
 MinBtn.Size = UDim2.fromOffset(24, 22)
-MinBtn.Position = UDim2.new(1, -32, 0.5, -11)
+MinBtn.Position = UDim2.new(1, -30, 0.5, -11)
 MinBtn.BackgroundColor3 = Color3.fromRGB(35, 40, 58)
 MinBtn.Text = "-"
 MinBtn.TextColor3 = Color3.fromRGB(210, 220, 240)
@@ -954,60 +740,13 @@ end
 MinBtn.MouseButton1Click:Connect(toggleWindow)
 FloatBtn.MouseButton1Click:Connect(toggleWindow)
 
-local StatusCard = Instance.new("Frame")
-StatusCard.Size = UDim2.new(1, -24, 0, 64)
-StatusCard.Position = UDim2.fromOffset(12, 44)
-StatusCard.BackgroundColor3 = Color3.fromRGB(21, 24, 34)
-StatusCard.Parent = MainFrame
-Instance.new("UICorner", StatusCard).CornerRadius = UDim.new(0, 8)
-local CardStroke = Instance.new("UIStroke", StatusCard)
-CardStroke.Color = Color3.fromRGB(45, 55, 80)
-CardStroke.Thickness = 1
+local Container = Instance.new("Frame")
+Container.Size = UDim2.new(1, -20, 1, -46)
+Container.Position = UDim2.fromOffset(10, 40)
+Container.BackgroundTransparency = 1
+Container.Parent = MainFrame
 
-local StatusMainLabel = Instance.new("TextLabel")
-StatusMainLabel.Size = UDim2.new(1, -20, 0, 18)
-StatusMainLabel.Position = UDim2.fromOffset(10, 5)
-StatusMainLabel.BackgroundTransparency = 1
-StatusMainLabel.Text = "สถานะ: ปิดใช้งาน"
-StatusMainLabel.TextColor3 = Color3.fromRGB(0, 210, 255)
-StatusMainLabel.Font = Enum.Font.GothamBold
-StatusMainLabel.TextSize = 12
-StatusMainLabel.TextXAlignment = Enum.TextXAlignment.Left
-StatusMainLabel.Parent = StatusCard
-
-local CargoLabel = Instance.new("TextLabel")
-CargoLabel.Size = UDim2.new(1, -20, 0, 18)
-CargoLabel.Position = UDim2.fromOffset(10, 23)
-CargoLabel.BackgroundTransparency = 1
-CargoLabel.Text = "ของบนพ่วง: 0/8 | โหมด: รอรับของ"
-CargoLabel.TextColor3 = Color3.fromRGB(210, 215, 230)
-CargoLabel.Font = Enum.Font.GothamMedium
-CargoLabel.TextSize = 11
-CargoLabel.TextXAlignment = Enum.TextXAlignment.Left
-CargoLabel.Parent = StatusCard
-
-local ProfitLabel = Instance.new("TextLabel")
-ProfitLabel.Size = UDim2.new(1, -20, 0, 18)
-ProfitLabel.Position = UDim2.fromOffset(10, 41)
-ProfitLabel.BackgroundTransparency = 1
-ProfitLabel.Text = "รอบส่ง: 0 | กำไร: $0 | เงิน: $0 | เวลา: 00:00:00"
-ProfitLabel.TextColor3 = Color3.fromRGB(120, 235, 160)
-ProfitLabel.Font = Enum.Font.GothamMedium
-ProfitLabel.TextSize = 11
-ProfitLabel.TextXAlignment = Enum.TextXAlignment.Left
-ProfitLabel.Parent = StatusCard
-
-local Scroll = Instance.new("ScrollingFrame")
-Scroll.Size = UDim2.new(1, -24, 1, -120)
-Scroll.Position = UDim2.fromOffset(12, 114)
-Scroll.BackgroundTransparency = 1
-Scroll.ScrollBarThickness = 3
-Scroll.ScrollBarImageColor3 = Color3.fromRGB(80, 95, 130)
-Scroll.CanvasSize = UDim2.fromOffset(0, 0)
-Scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-Scroll.Parent = MainFrame
-
-local Layout = Instance.new("UIListLayout", Scroll)
+local Layout = Instance.new("UIListLayout", Container)
 Layout.Padding = UDim.new(0, 6)
 Layout.SortOrder = Enum.SortOrder.LayoutOrder
 
@@ -1015,13 +754,13 @@ local ToggleTweenInfo = TweenInfo.new(0.15)
 
 local function addToggle(title, defaultVal, callback)
 	local Row = Instance.new("Frame")
-	Row.Size = UDim2.new(1, -6, 0, 34)
+	Row.Size = UDim2.new(1, 0, 0, 32)
 	Row.BackgroundColor3 = Color3.fromRGB(22, 25, 36)
-	Row.Parent = Scroll
+	Row.Parent = Container
 	Instance.new("UICorner", Row).CornerRadius = UDim.new(0, 6)
 
 	local T = Instance.new("TextLabel")
-	T.Size = UDim2.new(1, -70, 1, 0)
+	T.Size = UDim2.new(1, -64, 1, 0)
 	T.Position = UDim2.fromOffset(12, 0)
 	T.BackgroundTransparency = 1
 	T.Text = title
@@ -1033,7 +772,7 @@ local function addToggle(title, defaultVal, callback)
 
 	local Sw = Instance.new("TextButton")
 	Sw.Size = UDim2.fromOffset(42, 20)
-	Sw.Position = UDim2.new(1, -52, 0.5, -10)
+	Sw.Position = UDim2.new(1, -50, 0.5, -10)
 	Sw.BackgroundColor3 = defaultVal and Color3.fromRGB(0, 190, 125) or Color3.fromRGB(50, 55, 75)
 	Sw.Text = ""
 	Sw.Parent = Row
@@ -1061,13 +800,13 @@ end
 
 local function addButton(title, btnLabel, callback)
 	local Row = Instance.new("Frame")
-	Row.Size = UDim2.new(1, -6, 0, 34)
+	Row.Size = UDim2.new(1, 0, 0, 32)
 	Row.BackgroundColor3 = Color3.fromRGB(22, 25, 36)
-	Row.Parent = Scroll
+	Row.Parent = Container
 	Instance.new("UICorner", Row).CornerRadius = UDim.new(0, 6)
 
 	local T = Instance.new("TextLabel")
-	T.Size = UDim2.new(1, -120, 1, 0)
+	T.Size = UDim2.new(1, -110, 1, 0)
 	T.Position = UDim2.fromOffset(12, 0)
 	T.BackgroundTransparency = 1
 	T.Text = title
@@ -1078,8 +817,8 @@ local function addButton(title, btnLabel, callback)
 	T.Parent = Row
 
 	local B = Instance.new("TextButton")
-	B.Size = UDim2.fromOffset(96, 22)
-	B.Position = UDim2.new(1, -106, 0.5, -11)
+	B.Size = UDim2.fromOffset(88, 22)
+	B.Position = UDim2.new(1, -96, 0.5, -11)
 	B.BackgroundColor3 = Color3.fromRGB(40, 95, 180)
 	B.Text = btnLabel
 	B.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -1096,7 +835,6 @@ end
 addToggle("ออโต้ส่งของ", Env.AutoDelivery, function(val)
 	Env.AutoDelivery = val
 	if not val then
-		RUNTIME.statusText = "ปิดใช้งาน"
 		local v = getMyVehicle()
 		local t = TowablesController.GetAttachedTrailer()
 		setVehicleAnchored(v, t, false)
@@ -1139,7 +877,7 @@ addButton("รีเซ็ตอาชีพใหม่", "รีเซ็ต",
 	end)
 end)
 
--- ================= ลูปป้องกันด่าน AFK (ไร้การกดปุ่มกวนหน้าจอ) =================
+-- ================= ลูปป้องกันด่าน AFK =================
 trackConnection(LocalPlayer.Idled:Connect(function()
 	if CONFIG.AntiAFK then
 		pcall(function()
@@ -1153,7 +891,6 @@ task.spawn(function()
 	while ScreenGui and ScreenGui.Parent and Env.AutoDeliverySession == CurrentSessionId do
 		if CONFIG.AntiAFK then
 			if game.PlaceId == AFK_PLACE_ID then
-				RUNTIME.statusText = "พบด่าน AFK กำลังกลับแมพหลัก"
 				pcall(function()
 					TeleportService:Teleport(MAIN_PLACE_ID, LocalPlayer)
 				end)
@@ -1177,69 +914,7 @@ task.spawn(function()
 				pcall(LocalPlayer.SetAttribute, LocalPlayer, "IsAFK", false)
 			end
 		end
-		task.wait(4)
-	end
-end)
-
--- ================= ลูปอัปเดต UI และซิงก์ค่าเงินสด =================
-task.spawn(function()
-	local lastStatusStr = ""
-	local lastCargoStr = ""
-	local lastProfitStr = ""
-	local lastCashVal = -1
-	local cachedCashStr = "0"
-	local cachedProfitStr = "0"
-
-	while ScreenGui and ScreenGui.Parent and Env.AutoDeliverySession == CurrentSessionId do
-		local curCash = getPlayerCash()
-		if (not RUNTIME.startCash or RUNTIME.startCash <= 0) and curCash > 0 then
-			RUNTIME.startCash = curCash
-		end
-
-		if MainFrame.Visible then
-			if curCash ~= lastCashVal then
-				lastCashVal = curCash
-				cachedCashStr = formatNumber(curCash)
-				local profit = RUNTIME.startCash and math.max(0, curCash - RUNTIME.startCash) or 0
-				cachedProfitStr = formatNumber(profit)
-			end
-
-			local newStatusStr = "สถานะ: " .. RUNTIME.statusText
-			if newStatusStr ~= lastStatusStr then
-				lastStatusStr = newStatusStr
-				StatusMainLabel.Text = newStatusStr
-			end
-
-			local newCargoStr = string.format(
-				"ของบนพ่วง: %d/%d | โหมด: %s",
-				RUNTIME.carried,
-				RUNTIME.maxCap,
-				RUNTIME.isDeliveringLatch and "กำลังส่งของ" or "กำลังรับของ"
-			)
-			if newCargoStr ~= lastCargoStr then
-				lastCargoStr = newCargoStr
-				CargoLabel.Text = newCargoStr
-			end
-
-			local elapsed = math.floor(os.clock() - RUNTIME.sessionStart)
-			local hours = math.floor(elapsed / 3600)
-			local mins = math.floor((elapsed % 3600) / 60)
-			local secs = elapsed % 60
-			local newProfitStr = string.format(
-				"รอบส่ง: %d | กำไร: $%s | เงิน: $%s | เวลา: %02d:%02d:%02d",
-				RUNTIME.deliveriesDone,
-				cachedProfitStr,
-				cachedCashStr,
-				hours,
-				mins,
-				secs
-			)
-			if newProfitStr ~= lastProfitStr then
-				lastProfitStr = newProfitStr
-				ProfitLabel.Text = newProfitStr
-			end
-		end
-		task.wait(0.35)
+		task.wait(5)
 	end
 end)
 
@@ -1247,7 +922,7 @@ end)
 task.spawn(function()
 	while ScreenGui and ScreenGui.Parent and Env.AutoDeliverySession == CurrentSessionId do
 		if not Env.AutoDelivery then
-			task.wait(0.3)
+			task.wait(0.35)
 			continue
 		end
 
@@ -1267,7 +942,6 @@ task.spawn(function()
 
 			local state = DeliveryJobTask.GetCurrentDeliveryState()
 
-			-- รอจังหวะเปลี่ยนผ่าน State สั้นๆ หลังส่งของเสร็จ เพื่อไม่ให้สคริปต์เข้าใจผิดว่างานหลุด
 			if not state and JobsUtil.DoesPlayerHaveJob(LocalPlayer, JobsConstants.JobIds.Delivery) then
 				local waitTransition = os.clock() + 1.2
 				while Env.AutoDelivery and not state and os.clock() < waitTransition do
@@ -1276,10 +950,8 @@ task.spawn(function()
 				end
 			end
 
-			-- กรณีเริ่มงานครั้งแรกสุดและยังไม่มี State งาน
 			if not state then
 				RUNTIME.isDeliveringLatch = false
-				RUNTIME.statusText = "หาจุดรับงานเริ่มต้น"
 				local startPart = getDeliveryLocationPart(nil)
 				if isValidPart(startPart) and vehicle then
 					if flatDistanceXZ(vehicle:GetPivot().Position, startPart.Position) > CONFIG.InZoneRadiusXZ then
@@ -1293,7 +965,7 @@ task.spawn(function()
 							break
 						end
 						dampSlidingIfNeeded()
-						task.wait(0.15)
+						task.wait(0.2)
 					end
 				else
 					task.wait(0.4)
@@ -1320,8 +992,6 @@ task.spawn(function()
 			-- ================= 1. โหมดไปจุดส่งของ =================
 			if RUNTIME.isDeliveringLatch and state.DestinationPosition ~= nil then
 				local destPos = state.DestinationPosition
-				RUNTIME.statusText = string.format("ไปจุดส่งของ (%d/%d)", carried, maxCap)
-
 				local dropoffPart = getDeliveryLocationPart(destPos, CONFIG.ExactPadRadius)
 				local curVeh = getMyVehicle()
 
@@ -1348,15 +1018,11 @@ task.spawn(function()
 					dampSlidingIfNeeded()
 
 					local current = DeliveryJobTask.GetCurrentDeliveryState()
-					local curCarried, curMaxCap = getDeliveryMetrics(current)
-					RUNTIME.statusText = string.format("กำลังส่งของ (%d/%d)", curCarried, curMaxCap)
+					local curCarried = getDeliveryMetrics(current)
 
 					if not current or curCarried == 0 then
-						RUNTIME.deliveriesDone += 1
-						RUNTIME.statusText = "ส่งของสำเร็จ"
 						RUNTIME.isDeliveringLatch = false
-						task.wait(0.3)
-						getPlayerCash() -- บังคับซิงก์ค่าเงินทันทีหลังส่งเสร็จ
+						task.wait(0.25)
 						break
 					end
 
@@ -1366,7 +1032,6 @@ task.spawn(function()
 						dropTimeout = os.clock() + 18
 					end
 
-					-- ถ้าระบบกำลังหมุนหลอดเหลืองส่งของอยู่ ห้ามนับว่าค้างเด็ดขาด
 					if current.IsDropping then
 						lastProgressTime = os.clock()
 					end
@@ -1407,14 +1072,14 @@ task.spawn(function()
 							task.wait(0.2)
 						end
 					end
-					task.wait(0.15)
+
+					-- ผ่อนจังหวะลูปให้ CPU พักเมื่อหลอดเหลืองกำลังหมุนทำงานอยู่
+					task.wait(current.IsDropping and 0.28 or 0.16)
 				end
 
 			-- ================= 2. โหมดไปจุดรับของ =================
 			elseif state.PickupPosition ~= nil then
 				local pickupPos = state.PickupPosition
-				RUNTIME.statusText = string.format("ไปจุดรับของ (%d/%d)", carried, maxCap)
-
 				local pickupPart = getDeliveryLocationPart(pickupPos, CONFIG.ExactPadRadius)
 				local curVeh = getMyVehicle()
 
@@ -1445,7 +1110,6 @@ task.spawn(function()
 					if not current then break end
 
 					local curCarried, curMaxCap, curRem = getDeliveryMetrics(current)
-					RUNTIME.statusText = string.format("รับของขึ้นพ่วง (%d/%d)", curCarried, curMaxCap)
 
 					if curCarried > lastCarried then
 						lastCarried = curCarried
@@ -1453,12 +1117,10 @@ task.spawn(function()
 						collectTimeout = os.clock() + 20
 					end
 
-					-- ถ้าระบบกำลังหมุนหลอดเหลืองรับของอยู่ ห้ามนับว่าค้างและห้ามวาร์ปซ้ำเด็ดขาด
 					if current.IsCollecting then
 						lastIncreaseTime = os.clock()
 					end
 
-					-- โหลดแมพจุดส่งล่วงหน้าในพื้นหลังเมื่อของใกล้เต็มพ่วง
 					if not preStreamedDest and curCarried >= (curMaxCap - 1) and current.DestinationPosition then
 						preStreamedDest = true
 						local dPos = current.DestinationPosition
@@ -1509,11 +1171,13 @@ task.spawn(function()
 					elseif curPickPos and curVeh and not current.IsCollecting then
 						safeRequestStream(curPickPos, 1.4)
 						if flatDistanceXZ(curVeh:GetPivot().Position, curPickPos) > 25 then
-							teleportTruckAndTrailer(CFrame.new(curPickPos), curPickPos, flipPickupYaw)
+							teleportTruckAndTrailer(CFrame.new(curDestPos or curPickPos), curPickPos, flipPickupYaw)
 							task.wait(0.2)
 						end
 					end
-					task.wait(0.15)
+
+					-- ผ่อนจังหวะลูปให้ CPU พักเมื่อหลอดเหลืองกำลังหมุนทำงานอยู่
+					task.wait(current.IsCollecting and 0.28 or 0.16)
 				end
 			end
 		end)
@@ -1524,6 +1188,6 @@ task.spawn(function()
 			setVehicleAnchored(v, t, false)
 			warn("[AutoDelivery Error]:", err)
 		end
-		task.wait(0.12)
+		task.wait(0.15)
 	end
 end)
